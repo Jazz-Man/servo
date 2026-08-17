@@ -16,9 +16,9 @@ use devtools_traits::{HttpRequest, HttpResponse};
 use headers::{ContentLength, HeaderMapExt};
 use http::HeaderMap;
 use malloc_size_of_derive::MallocSizeOf;
-use net::cookie::ServoCookie;
+use cookie_jar::{CookieSource, StoredCookie};
 use net_traits::fetch::headers::extract_mime_type_as_dataurl_mime;
-use net_traits::{CookieSource, TlsSecurityInfo};
+use net_traits::TlsSecurityInfo;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use servo_url::ServoUrl;
@@ -653,7 +653,7 @@ fn get_cookies_from_headers(headers: &HeaderMap, url: &ServoUrl) -> Vec<CookieWr
         .iter()
         .filter_map(|cookie| {
             let cookie_str = std::str::from_utf8(cookie.as_bytes()).ok()?;
-            ServoCookie::from_cookie_string(cookie_str, url, CookieSource::HTTP)
+            StoredCookie::from_cookie_string(cookie_str, url.as_url(), CookieSource::Http)
         })
         .map(|cookie| {
             let cookie = &cookie.cookie;

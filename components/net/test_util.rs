@@ -268,3 +268,98 @@ pub fn make_body(bytes: Vec<u8>) -> BoxBody<Bytes, hyper::Error> {
         .map_err(|_| unreachable!())
         .boxed()
 }
+
+/// Like [`make_ssl_server`], but the TLS config offers only `h2` via ALPN and
+/// connections are served through `hyper_util`'s auto builder, so the
+/// negotiation cannot fall back to HTTP/1.1 — every connection speaks H2.
+pub fn make_h2_server<H>(handler: H) -> (Server, UrlWithBlobClaim)
+where
+    H: Fn(HyperRequest<Incoming>, &mut HyperResponse<BoxBody<Bytes, hyper::Error>>)
+        + Send
+        + Sync
+        + 'static,
+{
+    if !async_runtime_initialized() {
+        let _ = &*ASYNC_RUNTIME;
+    }
+    let handler = Arc::new(handler);
+    let listener = StdTcpListener::bind("[::0]:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener =
+        spawn_blocking_task::<_, TcpListener>(
+            async move { TcpListener::from_std(listener).unwrap() },
+        );
+
+    let url_string = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+    let url = UrlWithBlobClaim::new(ServoUrl::parse(&url_string).unwrap(), None);
+
+    let cert_path = Path::new("../../resources/self_signed_certificate_for_testing.crt")
+        .canonicalize()
+        .unwrap();
+    let key_path = Path::new("../../resources/privatekey_for_testing.key")
+        .canonicalize()
+        .unwrap();
+    let certificates = load_certificates_from_pem(&cert_path).expect("Invalid certificate");
+    let key = load_private_key_from_file(&key_path).expect("Invalid key");
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates.clone(), key)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+        .expect("Could not create rustls ServerConfig");
+    // Offer h2 only: a client that cannot speak H2 fails the handshake
+    // instead of silently negotiating HTTP/1.1.
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let server = async move {
+        loop {
+            let stream = tokio::select! {
+                stream = listener.accept() => stream.unwrap().0,
+                _val = &mut rx => break
+            };
+
+            let stream = stream.into_std().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::new(5, 0)))
+                .unwrap();
+            let stream = TcpStream::from_std(stream).unwrap();
+
+            let handler = handler.clone();
+            let acceptor = acceptor.clone();
+
+            let stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(_) => {
+                    eprintln!("Error handling TLS stream.");
+                    continue;
+                },
+            };
+
+            let _ = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |req: HyperRequest<Incoming>| {
+                    let mut response =
+                        HyperResponse::new(Empty::new().map_err(|_| unreachable!()).boxed());
+                    handler(req, &mut response);
+                    ready(Ok::<_, Infallible>(response))
+                }),
+            )
+            .await;
+        }
+    };
+
+    spawn_task(server);
+
+    (
+        Server {
+            close_channel: tx,
+            certificates: Some(certificates),
+        },
+        url,
+    )
+}

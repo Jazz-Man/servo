@@ -18,6 +18,7 @@ atomic_refcell = { workspace = true }
 parking_lot = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+cookie-jar = { path = "../../../../crates/cookie-jar" }
 crossbeam-channel = { workspace = true }
 devtools_traits = { workspace = true }
 embedder_traits = { workspace = true }

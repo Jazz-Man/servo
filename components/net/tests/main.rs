@@ -16,6 +16,7 @@ fn fetch(request: Request, dc: Option<Sender<DevtoolsControlMsg>>) -> Response {
 }
 mod file_loader;
 mod filemanager_thread;
+mod h2_cancellation;
 mod hsts;
 mod http_cache;
 mod http_loader;
@@ -117,7 +118,12 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
         auth_cache: RwLock::new(net::resource_thread::AuthCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: net::http_cache::HttpCache::default(),
-        wreq_client: wreq::Client::new(),
+        wreq_client: wreq::Client::builder()
+            .dns_resolver(net::connector::ServoDnsResolver::new())
+            .build()
+            // builder sets only the DNS resolver; failure would be a
+            // test-harness bug
+            .unwrap(),
         override_manager,
         embedder_proxy: fc.unwrap_or_else(|| create_generic_embedder_proxy()),
     }
@@ -138,6 +144,7 @@ fn create_http_state_trusting_certs(
         .unwrap();
     let wreq_client = wreq::Client::builder()
         .tls_cert_store(cert_store)
+        .dns_resolver(net::connector::ServoDnsResolver::new())
         .build()
         .unwrap();
     let override_manager = net::connector::CertificateErrorOverrideManager::new();

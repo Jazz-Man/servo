@@ -75,9 +75,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 
 use crate::async_runtime::spawn_task;
-use crate::connector::{
-    BoxedBody, CertificateErrorOverrideManager, TlsHandshakeInfo, create_tls_config,
-};
+use crate::connector::{BoxedBody, CertificateErrorOverrideManager, TlsHandshakeInfo};
 use crate::decoder::Decoder;
 use crate::devtools::{
     prepare_devtools_request, send_request_to_devtools, send_response_values_to_devtools,
@@ -2168,24 +2166,16 @@ async fn http_network_fetch(
                 )
             };
 
-            let mut tls_config = create_tls_config(
-                context.ca_certificates.clone(),
-                context.ignore_certificate_errors,
-                context.state.override_manager.clone(),
-            );
-            tls_config.alpn_protocols = vec!["http/1.1".to_string().into()];
-
-            let response = match start_websocket(
+            let handshake = match start_websocket(
                 context.state.clone(),
                 resource_event_sender,
                 protocols,
                 request,
-                tls_config,
                 dom_action_receiver,
             )
             .await
             {
-                Ok(response) => response,
+                Ok(handshake) => handshake,
                 Err(error) => {
                     return Response::network_error(NetworkError::WebsocketConnectionFailure(
                         format!("{error:?}"),
@@ -2193,12 +2183,17 @@ async fn http_network_fetch(
                 },
             };
 
-            let response = response.map(|r| match r {
-                Some(body) => Full::from(body).map_err(|_| unreachable!()).boxed(),
-                None => http_body_util::Empty::new()
-                    .map_err(|_| unreachable!())
-                    .boxed(),
-            });
+            // An empty body is correct — the WS response body is not the
+            // message channel; `run_ws_loop` owns the stream.
+            let mut builder = HyperResponse::builder().status(handshake.status);
+            for (name, value) in handshake.headers.iter() {
+                builder = builder.header(name, value);
+            }
+            let response = builder
+                .body(BoxedBody::new(
+                    Full::new(Bytes::new()).map_err(|_| unreachable!()),
+                ))
+                .unwrap_or_else(|_| unreachable!("statically valid response"));
             (Decoder::detect(response, url.is_secure_scheme()), None)
         },
         // Let connection be the result of obtaining a connection, given networkPartitionKey,

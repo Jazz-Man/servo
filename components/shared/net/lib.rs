@@ -14,7 +14,6 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper_serde::Serde;
-use hyper_util::client::legacy::Error as HyperError;
 use ipc_channel::ipc::{self, IpcSender};
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
@@ -24,7 +23,6 @@ use profile_traits::mem::ReportsChan;
 use rand::{Rng, rng};
 use request::RequestId;
 use rustc_hash::FxHashMap;
-use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{
     self, CallbackSetter, GenericCallback, GenericOneshotSender, GenericSend, GenericSender,
@@ -1267,14 +1265,6 @@ impl NetworkError {
                 NetworkError::CorsHeaders |
                 NetworkError::UnsupportedScheme
         )
-    }
-
-    pub fn from_hyper_error(error: &HyperError, certificate: Option<CertificateDer>) -> Self {
-        let error_string = error.to_string();
-        match certificate {
-            Some(certificate) => NetworkError::SslValidation(error_string, certificate.to_vec()),
-            _ => NetworkError::HttpError(error_string),
-        }
     }
 }
 

@@ -14,33 +14,29 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use async_tungstenite::WebSocketStream;
-use async_tungstenite::tokio::{ConnectStream, client_async_tls_with_connector_and_config};
 use futures::stream::StreamExt;
-use headers::{
-    Authorization, Connection, HeaderMapExt, SecWebsocketKey, SecWebsocketVersion, Upgrade,
-};
+use headers::{Authorization, HeaderMapExt};
 use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
+use http::{Method, StatusCode};
 use ipc_channel::ipc::IpcSender;
 use log::{debug, trace, warn};
 use net_traits::request::{RequestBuilder, RequestMode};
 use net_traits::{MessageData, WebSocketDomAction, WebSocketNetworkEvent};
 use servo_base::generic_channel::CallbackSetter;
 use servo_url::ServoUrl;
-use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio_rustls::TlsConnector;
-use tungstenite::error::{Error, ProtocolError, UrlError};
-use tungstenite::handshake::client::Response;
-use tungstenite::protocol::CloseFrame;
-use tungstenite::{ClientRequestBuilder, Message};
+use tungstenite::Message;
+use tungstenite::error::{Error, ProtocolError};
+use wreq::redirect;
+use wreq::ws::WebSocket;
+use wreq::ws::message::CloseFrame as WreqCloseFrame;
+use wreq::ws::message::Message as WreqMessage;
 
 use crate::async_runtime::spawn_task;
-use crate::connector::TlsConfig;
-use crate::hosts::replace_host;
 use crate::http_loader::HttpState;
+use crate::ws_map;
 
 /// Create a Request object for the initial HTTP request.
 /// This request contains `Origin`, `Sec-WebSocket-Protocol`, `Authorization`,
@@ -51,43 +47,25 @@ pub fn create_handshake_request(
     request: RequestBuilder,
     http_state: Arc<HttpState>,
 ) -> Result<net_traits::request::Request, Error> {
-    let origin = request.url.origin();
-
     let mut headers = HeaderMap::new();
     headers.insert(
         "Origin",
         HeaderValue::from_str(&request.url.origin().ascii_serialization())?,
     );
 
-    let host = format!(
-        "{}",
-        origin
-            .host()
-            .ok_or_else(|| Error::Url(UrlError::NoHostName))?
-    );
-    headers.insert("Host", HeaderValue::from_str(&host)?);
-
     // https://websockets.spec.whatwg.org/#concept-websocket-establish
-    // 3. Append (`Upgrade`, `websocket`) to request’s header list.
-    headers.typed_insert(Upgrade::websocket());
-
-    // 4. Append (`Connection`, `Upgrade`) to request’s header list.
-    headers.typed_insert(Connection::upgrade());
-
-    // 5. Let keyValue be a nonce consisting of a randomly selected 16-byte value that has been
-    // forgiving-base64-encoded and isomorphic encoded.
-    let mut nonce: [u8; 16] = [0; 16];
-    rand::fill(&mut nonce);
-    let sec_websocket_key_header: SecWebsocketKey = nonce.into();
-
-    // 6. Append (`Sec-WebSocket-Key`, keyValue) to request’s header list.
-    headers.typed_insert(sec_websocket_key_header);
-
-    // 7. Append (`Sec-WebSocket-Version`, `13`) to request’s header list.
-    headers.typed_insert(SecWebsocketVersion::V13);
+    // 3./7. Append (`Upgrade`, `websocket`) and (`Sec-WebSocket-Version`, `13`).
+    // wreq re-sets both inside `send()` — they ride here as request METADATA:
+    // the engine's delegation seam detects WS handshakes by this pair
+    // (client `policy::is_websocket_handshake`) to deny them before any
+    // network work. Connection/Sec-WebSocket-Key stay wreq's alone.
+    headers.insert("Upgrade", HeaderValue::from_static("websocket"));
+    headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
 
     // 8. For each protocol in protocols, combine (`Sec-WebSocket-Protocol`, protocol) in request’s
     // header list.
+    // wreq joins a `protocols()` list with ", " — servo's "," join rides as
+    // one plain header value instead.
     let protocols = match request.mode {
         RequestMode::WebSocket {
             ref protocols,
@@ -122,13 +100,13 @@ pub fn create_handshake_request(
 /// match the list of provided protocols in the original request.
 fn process_ws_response(
     http_state: &HttpState,
-    response: &Response,
+    response_headers: &HeaderMap,
     resource_url: &ServoUrl,
     protocols: &[String],
 ) -> Result<Option<String>, Error> {
     trace!("processing websocket http response for {}", resource_url);
     let mut protocol_in_use = None;
-    if let Some(protocol_name) = response.headers().get("Sec-WebSocket-Protocol") {
+    if let Some(protocol_name) = response_headers.get("Sec-WebSocket-Protocol") {
         let protocol_name = protocol_name.to_str().unwrap_or("");
         if !protocols.is_empty() && !protocols.iter().any(|p| protocol_name == (*p)) {
             return Err(Error::Protocol(ProtocolError::InvalidHeader(Box::new(
@@ -139,7 +117,7 @@ fn process_ws_response(
     }
 
     // TODO(eijebong): Replace thise once typed headers settled on a cookie impl
-    for cookie in response.headers().get_all(header::SET_COOKIE) {
+    for cookie in response_headers.get_all(header::SET_COOKIE) {
         let cookie_bytes = cookie.as_bytes();
         if !cookie_jar::StoredCookie::is_valid_name_or_value(cookie_bytes) {
             continue;
@@ -154,7 +132,7 @@ fn process_ws_response(
     http_state
         .hsts_list
         .write()
-        .update_hsts_list_from_response(resource_url, response.headers());
+        .update_hsts_list_from_response(resource_url, response_headers);
 
     Ok(protocol_in_use)
 }
@@ -209,7 +187,7 @@ fn setup_dom_listener(
 async fn run_ws_loop(
     mut dom_receiver: UnboundedReceiver<DomMsg>,
     resource_event_sender: IpcSender<WebSocketNetworkEvent>,
-    mut stream: WebSocketStream<ConnectStream>,
+    mut stream: WebSocket,
 ) {
     loop {
         select! {
@@ -221,17 +199,20 @@ async fn run_ws_loop(
                 };
                 match dom_msg {
                     DomMsg::Send(m) => {
-                        if let Err(e) = stream.send(m).await {
+                        if let Err(e) = stream.send(ws_map::dom_to_wreq(m)).await {
                             warn!("error sending websocket message: {:?}", e);
                         }
                     },
                     DomMsg::Close(frame) => {
-                        if let Err(e) = stream.close(frame.map(|(code, reason)| {
-                            CloseFrame {
+                        // A close frame sent through the normal sink keeps the
+                        // loop running to receive the server's echo, exactly
+                        // as `WebSocketStream::close` did.
+                        if let Err(e) = stream.send(WreqMessage::Close(frame.map(|(code, reason)| {
+                            WreqCloseFrame {
                                 code: code.into(),
                                 reason: reason.into(),
                             }
-                        })).await {
+                        }))).await {
                             warn!("error closing websocket: {:?}", e);
                         }
                     },
@@ -253,31 +234,9 @@ async fn run_ws_loop(
                     }
                 };
                 match msg {
-                    Message::Text(s) => {
-                        let message = MessageData::Text(s.as_str().to_owned());
-                        if let Err(e) = resource_event_sender
-                            .send(WebSocketNetworkEvent::MessageReceived(message))
-                        {
-                            warn!("Error sending websocket notification: {:?}", e);
-                            break;
-                        }
-                    }
-
-                    Message::Binary(v) => {
-                        let message = MessageData::Binary(v.to_vec());
-                        if let Err(e) = resource_event_sender
-                            .send(WebSocketNetworkEvent::MessageReceived(message))
-                        {
-                            warn!("Error sending websocket notification: {:?}", e);
-                            break;
-                        }
-                    }
-
-                    Message::Ping(_) | Message::Pong(_) => {}
-
-                    Message::Close(frame) => {
+                    WreqMessage::Close(frame) => {
                         let (reason, code) = match frame {
-                            Some(frame) => (frame.reason, Some(frame.code.into())),
+                            Some(frame) => (frame.reason, Some(u16::from(frame.code))),
                             None => ("".into(), None),
                         };
                         debug!("Websocket connection closing due to ({:?}) {}", code, reason);
@@ -288,12 +247,46 @@ async fn run_ws_loop(
                         break;
                     }
 
-                    Message::Frame(_) => {
-                        warn!("Unexpected websocket frame message");
+                    other => {
+                        if let Some(message) = ws_map::wreq_to_message_data(other) {
+                            if let Err(e) = resource_event_sender
+                                .send(WebSocketNetworkEvent::MessageReceived(message))
+                            {
+                                warn!("Error sending websocket notification: {:?}", e);
+                                break;
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/// Everything the fetch pipeline needs from a completed WS handshake: the
+/// status and headers to build its page-visible response. The message stream
+/// stays behind `run_ws_loop`.
+pub(crate) struct WsHandshake {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+}
+
+/// Why a WS connection could not start. `wreq::Error` exposes no public
+/// constructor able to carry `process_ws_response`'s protocol failure, so the
+/// two failure families ride side by side instead of a lossy conversion.
+/// The payloads are consumed only through the derived `Debug` that the
+/// fetch arm formats — rustc's dead-code analysis skips derived impls,
+/// hence the allow.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum WsStartError {
+    Handshake(wreq::Error),
+    Protocol(Error),
+}
+
+impl From<wreq::Error> for WsStartError {
+    fn from(error: wreq::Error) -> Self {
+        WsStartError::Handshake(error)
     }
 }
 
@@ -305,65 +298,78 @@ pub(crate) async fn start_websocket(
     resource_event_sender: IpcSender<WebSocketNetworkEvent>,
     protocols: &[String],
     client: &net_traits::request::Request,
-    tls_config: TlsConfig,
     dom_action_receiver: CallbackSetter<WebSocketDomAction>,
-) -> Result<Response, Error> {
+) -> Result<WsHandshake, WsStartError> {
     trace!("starting WS connection to {}", client.url());
 
     let initiated_close = Arc::new(AtomicBool::new(false));
     let dom_receiver = setup_dom_listener(dom_action_receiver, initiated_close.clone());
 
     let url = client.url();
-    let host = replace_host(url.host_str().expect("URL has no host"));
-    let mut net_url = client.url().into_url();
-    net_url
-        .set_host(Some(&host))
-        .map_err(|e| Error::Url(UrlError::UnableToConnect(e.to_string())))?;
 
-    let domain = net_url
-        .host()
-        .ok_or_else(|| Error::Url(UrlError::NoHostName))?;
-    let port = net_url
-        .port_or_known_default()
-        .ok_or_else(|| Error::Url(UrlError::UnableToConnect("Unknown port".into())))?;
-
-    let try_socket = TcpStream::connect((&*domain.to_string(), port)).await;
-    let socket = try_socket.map_err(Error::Io)?;
-    let connector = TlsConnector::from(Arc::new(tls_config));
-
-    // TODO(pylbrecht): move request conversion to a separate function
-    let mut original_url = client.original_url();
-    if original_url.scheme() == "ws" && url.scheme() == "https" {
-        original_url.as_mut_url().set_scheme("wss").unwrap();
-    }
-    let mut builder =
-        ClientRequestBuilder::new(original_url.as_str().parse().expect("unable to parse URI"));
-    for (key, value) in client.headers.iter() {
-        builder = builder.with_header(
-            key.as_str(),
-            value
-                .to_str()
-                .expect("unable to convert header value to string"),
-        );
+    // The handshake URI is the original ws/wss URL (scheme repaired for a
+    // handshake that ended on https); wreq's `send()` maps ws→http /
+    // wss→https itself. Host-table mapping happens in `ServoDnsResolver`,
+    // like every other wreq transport fetch.
+    let mut ws_url = client.original_url();
+    if ws_url.scheme() == "ws" && url.scheme() == "https" {
+        ws_url.as_mut_url().set_scheme("wss").unwrap();
     }
 
-    let (stream, response) =
-        client_async_tls_with_connector_and_config(builder, socket, Some(connector), None).await?;
+    // Built via `WebSocketRequestBuilder::new` rather than `Client::websocket`
+    // so the handshake carries the same no-follow redirect policy as the
+    // HTTP transport (see obtain_response in http_loader.rs) — a non-101
+    // must fail in `into_websocket`, never be followed.
+    let mut ws_response = wreq::ws::WebSocketRequestBuilder::new(
+        http_state
+            .wreq_client
+            .request(Method::GET, ws_url.as_str())
+            .redirect(redirect::Policy::none()),
+    )
+    .headers(client.headers.clone())
+    .send()
+    .await?;
 
-    let protocol_in_use = process_ws_response(&http_state, &response, &url, protocols)?;
+    // `WebSocketResponse` derefs to `wreq::Response`: status and headers
+    // read before the stream is consumed.
+    let status = ws_response.status();
+    let response_headers = ws_response.headers().clone();
+
+    // `into_websocket` enforces a stricter subprotocol policy than the spec:
+    // an echoed `Sec-WebSocket-Protocol` with no builder-level `protocols()`
+    // list is an error, and so is a missing echo when a list was set. servo's
+    // spec-compliant check in `process_ws_response` owns that decision — the
+    // header is removed so wreq's policy stays out of it.
+    ws_response
+        .headers_mut()
+        .remove(http::header::SEC_WEBSOCKET_PROTOCOL);
+
+    // Validate the handshake where tungstenite's used to (101, upgrade
+    // headers, accept key) — before any cookie/HSTS side effects run.
+    let websocket = ws_response.into_websocket().await?;
+
+    let protocol_in_use =
+        process_ws_response(&http_state, &response_headers, &url, protocols)
+            .map_err(WsStartError::Protocol)?;
 
     if !initiated_close.load(Ordering::SeqCst) {
         if resource_event_sender
             .send(WebSocketNetworkEvent::ConnectionEstablished { protocol_in_use })
             .is_err()
         {
-            return Ok(response);
+            return Ok(WsHandshake {
+                status,
+                headers: response_headers,
+            });
         }
 
         trace!("about to start ws loop for {}", url);
-        spawn_task(run_ws_loop(dom_receiver, resource_event_sender, stream));
+        spawn_task(run_ws_loop(dom_receiver, resource_event_sender, websocket));
     } else {
         trace!("client closed connection for {}, not running loop", url);
     }
-    Ok(response)
+    Ok(WsHandshake {
+        status,
+        headers: response_headers,
+    })
 }

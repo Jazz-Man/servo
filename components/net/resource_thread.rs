@@ -11,6 +11,7 @@ use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::thread;
+use std::time::Duration;
 
 use cookie::Cookie;
 use crossbeam_channel::Sender;
@@ -46,11 +47,12 @@ use servo_base::generic_channel::{
     GenericSelectionResult,
 };
 use servo_base::id::CookieStoreId;
+use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::async_runtime::{init_async_runtime, spawn_task};
-use crate::connector::{CACertificates, CertificateErrorOverrideManager};
+use crate::connector::{CACertificates, CertificateErrorOverrideManager, ServoDnsResolver};
 use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
@@ -212,7 +214,11 @@ fn create_http_states(
     // CoreResourceMsg::Exit).
     let (public_client, public_jar) = http_client.unwrap_or_else(|| {
         (
-            wreq::Client::new(),
+            wreq::Client::builder()
+                .dns_resolver(ServoDnsResolver::new())
+                .connect_timeout(Duration::from_secs(pref!(network_connection_timeout)))
+                .build()
+                .expect("building the default wreq client cannot fail"),
             match config_dir {
                 Some(config_dir) => Arc::new(cookie_jar::Jar::with_persistence(150, config_dir)),
                 None => Arc::new(cookie_jar::Jar::new(150)),
@@ -223,7 +229,11 @@ fn create_http_states(
     // own cookie-less client — the injected client's provider points at the
     // PUBLIC jar, and the WS handshake (no per-request override exists
     // there) would otherwise let private traffic write the public jar.
-    let private_client = wreq::Client::new();
+    let private_client = wreq::Client::builder()
+        .dns_resolver(ServoDnsResolver::new())
+        .connect_timeout(Duration::from_secs(pref!(network_connection_timeout)))
+        .build()
+        .expect("building the default wreq client cannot fail");
     let private_jar = Arc::new(cookie_jar::Jar::new(150));
 
     let override_manager = CertificateErrorOverrideManager::new();

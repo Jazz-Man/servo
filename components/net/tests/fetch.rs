@@ -839,7 +839,12 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
     let embedder_proxy = create_generic_embedder_proxy();
 
     let mut context = FetchContext {
-        state: Arc::new(create_http_state(None)),
+        // The server certificate is self-signed. The wreq path has no
+        // cert-override hook, so trust the certificate at the client instead.
+        state: Arc::new(create_http_state_trusting_certs(
+            None,
+            server.certificates.as_ref().unwrap(),
+        )),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
         filemanager: FileManager::new(
@@ -857,12 +862,6 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
     };
-
-    // The server certificate is self-signed, so we need to add an override
-    // so that the connection works properly.
-    for certificate in server.certificates.as_ref().unwrap().iter() {
-        context.state.override_manager.add_override(certificate);
-    }
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)

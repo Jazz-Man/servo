@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -66,12 +65,12 @@ fn lookup_host_replacement(table: &HashMap<String, IpAddr>, host: &str) -> Optio
     })
 }
 
-pub fn replace_host(host: &str) -> Cow<'_, str> {
+/// Returns the replacement IP for `host` from the host table (or `None`
+/// when the host table has no entry). Used by the wreq DNS resolver, which
+/// needs the address rather than a rewritten hostname string.
+pub fn replace_host_ip(host: &str) -> Option<IpAddr> {
     HOST_TABLE
         .lock()
         .as_ref()
         .and_then(|table| lookup_host_replacement(table, host))
-        .map_or(host.into(), |replaced_host| {
-            replaced_host.to_string().into()
-        })
 }

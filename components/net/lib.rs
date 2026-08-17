@@ -6,8 +6,6 @@
 
 pub mod async_runtime;
 pub mod connector;
-pub mod cookie;
-pub mod cookie_storage;
 mod decoder;
 mod devtools;
 pub mod embedder;
@@ -25,6 +23,7 @@ pub mod subresource_integrity;
 #[cfg(feature = "test-util")]
 pub mod test_util;
 mod websocket_loader;
+pub mod ws_map;
 
 /// An implementation of the [Fetch specification](https://fetch.spec.whatwg.org/)
 pub mod fetch {

@@ -26,7 +26,6 @@ data-url = { workspace = true }
 embedder_traits = { workspace = true }
 headers = { workspace = true }
 http = { workspace = true }
-hyper-util = { workspace = true }
 hyper_serde = { workspace = true }
 ipc-channel = { workspace = true }
 log = { workspace = true }
@@ -42,7 +41,6 @@ profile_traits = { workspace = true }
 rand = { workspace = true }
 resvg = { workspace = true }
 rustc-hash = { workspace = true }
-rustls-pki-types = { workspace = true }
 serde = { workspace = true }
 servo-base = { workspace = true }
 servo-config = { workspace = true }
