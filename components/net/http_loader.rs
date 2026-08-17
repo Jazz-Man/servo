@@ -2244,6 +2244,10 @@ async fn http_network_fetch(
     let timing = context.timing.inner().clone();
     let mut response = Response::new(url.clone(), timing);
 
+    // Unreachable in practice since the wreq swap — wreq exposes no
+    // TLS-info hook, so nothing inserts this extension (the hyper
+    // connector's InstrumentedConnector did); SecurityInfo events are dead
+    // until one exists.
     if let Some(handshake_info) = res.extensions().get::<TlsHandshakeInfo>() {
         let mut hsts_enabled = url
             .host_str()

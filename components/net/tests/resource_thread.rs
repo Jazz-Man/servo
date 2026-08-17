@@ -4,7 +4,6 @@
 
 use std::net::IpAddr;
 
-use net::connector::CACertificates;
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_core_resource_thread;
 use net::test::parse_hostsfile;
@@ -30,8 +29,6 @@ fn test_exit() {
         MemProfilerChan(mtx),
         create_generic_embedder_proxy(),
         None,
-        CACertificates::Default,
-        false, /* ignore_certificate_errors */
         std::sync::Arc::new(ProtocolRegistry::default()),
         None, /* http_client */
     );

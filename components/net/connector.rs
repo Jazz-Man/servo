@@ -48,6 +48,9 @@ impl CertificateErrorOverrideManager {
 
     /// Add a certificate to this manager's list of certificates for which to ignore
     /// validation errors.
+    ///
+    /// Write-only since the wreq swap — no verifier hook consumes overrides
+    /// yet; revisit when wreq exposes one.
     pub fn add_override(&self, certificate: &CertificateDer<'static>) {
         self.0.lock().overrides.push(certificate.clone());
     }

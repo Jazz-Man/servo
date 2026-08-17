@@ -69,6 +69,8 @@ pub struct Opts {
     pub temporary_storage: bool,
 
     /// Path to PEM encoded SSL CA certificate store.
+    /// Write-only since the wreq swap — the consumer chain into the net
+    /// thread is gone; kept as embedder/CLI surface for a future verifier hook.
     pub certificate_path: Option<String>,
 
     /// Path to a hosts file (like `/etc/hosts`).
@@ -76,6 +78,8 @@ pub struct Opts {
     pub host_file: Option<PathBuf>,
 
     /// Whether or not to completely ignore SSL certificate validation errors.
+    /// Write-only since the wreq swap — the consumer chain into the net
+    /// thread is gone; kept as embedder/CLI surface for a future verifier hook.
     /// TODO: We should see if we can eliminate the need for this by fixing
     /// <https://github.com/servo/servo/issues/30080>.
     pub ignore_certificate_errors: bool,

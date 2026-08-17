@@ -25,7 +25,6 @@ use hyper::body::{Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use mime::{self, Mime};
 use net::async_runtime::spawn_blocking_task;
-use net::connector::CACertificates;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, FetchContext};
 use net::filemanager_thread::FileManager;
@@ -794,8 +793,6 @@ fn test_fetch_with_hsts() {
         timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
-        ca_certificates: CACertificates::Default,
-        ignore_certificate_errors: false,
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
     };
@@ -857,8 +854,6 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
-        ca_certificates: CACertificates::Default,
-        ignore_certificate_errors: false,
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
     };
@@ -920,8 +915,6 @@ fn test_fetch_self_signed() {
         timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
-        ca_certificates: CACertificates::Default,
-        ignore_certificate_errors: false,
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
     };
@@ -945,9 +938,10 @@ fn test_fetch_self_signed() {
         Some(NetworkError::HttpError(..))
     ));
 
-    // The override manager no longer feeds the HTTP path (it stays wired to
-    // the WebSocket connector only), so adding an override must NOT rescue
-    // the fetch: self-signed stays rejected on the internal path.
+    // The cert-override machinery lost its consumer when the verifier died
+    // with the hyper connector (websocket_loader has no override reference
+    // either) — overrides are currently write-only, so adding one must NOT
+    // rescue the fetch: self-signed stays rejected on the internal path.
     for certificate in server.certificates.as_ref().unwrap().iter() {
         context.state.override_manager.add_override(certificate);
     }
@@ -1574,8 +1568,6 @@ fn test_fetch_request_intercepted() {
         timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
         websocket_chan: None,
-        ca_certificates: CACertificates::Default,
-        ignore_certificate_errors: false,
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
     };

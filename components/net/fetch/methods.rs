@@ -45,7 +45,6 @@ use servo_url::{Host, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
 
-use crate::connector::CACertificates;
 use crate::devtools::{
     send_early_httprequest_to_devtools, send_response_to_devtools, send_security_info_to_devtools,
 };
@@ -107,8 +106,6 @@ pub struct FetchContext {
     pub timing: ResourceFetchTimingContainer,
     pub protocols: Arc<ProtocolRegistry>,
     pub websocket_chan: Option<Arc<Mutex<WebSocketChannel>>>,
-    pub ca_certificates: CACertificates<'static>,
-    pub ignore_certificate_errors: bool,
     pub preloaded_resources: SharedPreloadedResources,
     pub in_flight_keep_alive_records: SharedInflightKeepAliveRecords,
 }

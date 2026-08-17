@@ -6,8 +6,6 @@
 
 use std::borrow::ToOwned;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::thread;
@@ -39,8 +37,6 @@ use profile_traits::mem::{
 use profile_traits::path;
 use profile_traits::time::ProfilerChan;
 use rustc_hash::FxHashMap;
-use rustls_pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{
     self, CallbackSetter, GenericCallback, GenericReceiver, GenericReceiverSet,
@@ -52,7 +48,7 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::async_runtime::{init_async_runtime, spawn_task};
-use crate::connector::{CACertificates, CertificateErrorOverrideManager, ServoDnsResolver};
+use crate::connector::{CertificateErrorOverrideManager, ServoDnsResolver};
 use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
@@ -69,42 +65,18 @@ use crate::protocols::ProtocolRegistry;
 use crate::request_interceptor::RequestInterceptor;
 use crate::websocket_loader::create_handshake_request;
 
-/// Load a file with CA certificate and produce a RootCertStore with the results.
-fn load_root_cert_store_from_file(file_path: String) -> io::Result<Vec<CertificateDer<'static>>> {
-    let mut pem = BufReader::new(File::open(file_path)?);
-
-    let certs = CertificateDer::pem_reader_iter(&mut pem)
-        .filter_map(|cert| {
-            cert.inspect_err(|e| log::error!("Could not load certificate ({e}). Ignoring it."))
-                .ok()
-        })
-        .collect();
-    Ok(certs)
-}
-
 /// Returns a tuple of (public, private) senders to the new threads.
-#[expect(clippy::too_many_arguments)]
 pub fn new_resource_threads(
     devtools_sender: Option<Sender<DevtoolsControlMsg>>,
     time_profiler_chan: ProfilerChan,
     mem_profiler_chan: MemProfilerChan,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     config_dir: Option<PathBuf>,
-    certificate_path: Option<String>,
-    ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
     http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
 ) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
     // Initialize the async runtime, and get a handle to it for use in clean shutdown.
     let async_runtime = init_async_runtime();
-
-    let ca_certificates = certificate_path
-        .and_then(|path| {
-            Some(CACertificates::Override(
-                load_root_cert_store_from_file(path).ok()?,
-            ))
-        })
-        .unwrap_or_default();
 
     let (public_core, private_core) = new_core_resource_thread(
         devtools_sender,
@@ -112,8 +84,6 @@ pub fn new_resource_threads(
         mem_profiler_chan,
         embedder_proxy,
         config_dir,
-        ca_certificates,
-        ignore_certificate_errors,
         protocols,
         http_client,
     );
@@ -125,15 +95,12 @@ pub fn new_resource_threads(
 }
 
 /// Create a CoreResourceThread
-#[expect(clippy::too_many_arguments)]
 pub fn new_core_resource_thread(
     devtools_sender: Option<Sender<DevtoolsControlMsg>>,
     time_profiler_chan: ProfilerChan,
     mem_profiler_chan: MemProfilerChan,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     config_dir: Option<PathBuf>,
-    ca_certificates: CACertificates<'static>,
-    ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
     http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
 ) -> (CoreResourceThread, CoreResourceThread) {
@@ -154,8 +121,6 @@ pub fn new_core_resource_thread(
                 devtools_sender,
                 time_profiler_chan,
                 embedder_proxy.clone(),
-                ca_certificates.clone(),
-                ignore_certificate_errors,
                 blob_token_communicator,
             );
 
@@ -714,8 +679,6 @@ pub struct CoreResourceManager {
     sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
     request_interceptor: RequestInterceptor,
-    ca_certificates: CACertificates<'static>,
-    ignore_certificate_errors: bool,
     preloaded_resources: SharedPreloadedResources,
     /// <https://fetch.spec.whatwg.org/#concept-fetch-record>
     in_flight_keep_alive_records: SharedInflightKeepAliveRecords,
@@ -726,8 +689,6 @@ impl CoreResourceManager {
         devtools_sender: Option<Sender<DevtoolsControlMsg>>,
         _profiler_chan: ProfilerChan,
         embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
-        ca_certificates: CACertificates<'static>,
-        ignore_certificate_errors: bool,
         blob_token_communicator: Arc<Mutex<BlobTokenCommunicator>>,
     ) -> CoreResourceManager {
         CoreResourceManager {
@@ -735,8 +696,6 @@ impl CoreResourceManager {
             sw_managers: Default::default(),
             filemanager: FileManager::new(embedder_proxy.clone(), blob_token_communicator),
             request_interceptor: RequestInterceptor::new(embedder_proxy),
-            ca_certificates,
-            ignore_certificate_errors,
             preloaded_resources: Default::default(),
             in_flight_keep_alive_records: Default::default(),
         }
@@ -826,8 +785,6 @@ impl CoreResourceManager {
             _ => (FileTokenCheck::NotRequired, None),
         };
 
-        let ca_certificates = self.ca_certificates.clone();
-        let ignore_certificate_errors = self.ignore_certificate_errors;
         let in_flight_keep_alive_records = self.in_flight_keep_alive_records.clone();
         let preloaded_resources = self.preloaded_resources.clone();
         if let Some(ref preload_id) = request.preload_id {
@@ -852,8 +809,6 @@ impl CoreResourceManager {
                 timing: ResourceFetchTiming::new(request.timing_type()).into(),
                 protocols,
                 websocket_chan: None,
-                ca_certificates,
-                ignore_certificate_errors,
                 preloaded_resources: preloaded_resources.clone(),
                 in_flight_keep_alive_records,
             };
@@ -915,8 +870,6 @@ impl CoreResourceManager {
         let filemanager = self.filemanager.clone();
         let request_interceptor = self.request_interceptor.clone();
 
-        let ca_certificates = self.ca_certificates.clone();
-        let ignore_certificate_errors = self.ignore_certificate_errors;
         let in_flight_keep_alive_records = self.in_flight_keep_alive_records.clone();
         let preloaded_resources = self.preloaded_resources.clone();
 
@@ -951,8 +904,6 @@ impl CoreResourceManager {
                             event_sender.clone(),
                             Some(action_receiver),
                         )))),
-                        ca_certificates,
-                        ignore_certificate_errors,
                         preloaded_resources,
                         in_flight_keep_alive_records,
                     };

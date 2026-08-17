@@ -31,7 +31,6 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use devtools_traits::DevtoolsControlMsg;
 use embedder_traits::{AuthenticationResponse, EmbedderMsg, EmbedderProxy, GenericEmbedderProxy};
 use net::async_runtime::spawn_blocking_task;
-use net::connector::CACertificates;
 use net::embedder::NetToEmbedderMsg;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, FetchContext};
@@ -177,8 +176,6 @@ fn new_fetch_context(
         timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::with_internal_protocols()),
         websocket_chan: None,
-        ca_certificates: CACertificates::Default,
-        ignore_certificate_errors: false,
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
     }

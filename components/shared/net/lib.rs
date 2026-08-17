@@ -1162,6 +1162,7 @@ pub struct CookieAsyncResponse {
 pub enum NetworkError {
     LoadCancelled,
     /// SSL validation error, to be converted to Resource::BadCertHTML in the HTML parser.
+    /// No producer since the wreq swap; kept for IPC stability.
     SslValidation(String, Vec<u8>),
     /// Crash error, to be converted to Resource::Crash in the HTML parser.
     Crash(String),
