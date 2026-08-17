@@ -13,7 +13,7 @@ use async_recursion::async_recursion;
 use content_security_policy::percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use devtools_traits::ChromeToDevtoolsControlMsg;
 use embedder_traits::{AuthenticationResponse, GenericEmbedderProxy};
-use futures::{TryFutureExt, TryStreamExt, future};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, future};
 use headers::authorization::Basic;
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
@@ -26,8 +26,7 @@ use http::header::{
     CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LOCATION, CONTENT_TYPE, HeaderValue, RANGE,
     WWW_AUTHENTICATE,
 };
-use http::{HeaderMap, Method, Request as HyperRequest, StatusCode};
-use http_body_util::combinators::BoxBody;
+use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::Response as HyperResponse;
 use hyper::body::{Bytes, Frame};
@@ -77,7 +76,7 @@ use tracing::Instrument;
 
 use crate::async_runtime::spawn_task;
 use crate::connector::{
-    CertificateErrorOverrideManager, ServoClient, TlsHandshakeInfo, create_tls_config,
+    BoxedBody, CertificateErrorOverrideManager, TlsHandshakeInfo, create_tls_config,
 };
 use crate::decoder::Decoder;
 use crate::devtools::{
@@ -113,9 +112,6 @@ pub struct HttpState {
     pub http_cache: HttpCache,
     pub auth_cache: RwLock<AuthCache>,
     pub history_states: RwLock<FxHashMap<HistoryStateId, Vec<u8>>>,
-    pub client: ServoClient,
-    // The embedder-injected wreq client; cohabits with `client` until the
-    // hyper stack is removed. Nothing consumes it yet.
     pub wreq_client: wreq::Client,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
@@ -433,21 +429,21 @@ enum BodyChunk {
     Done,
 }
 
-/// The stream side of the body passed to hyper.
+/// The stream side of the body passed to wreq.
 enum BodyStream {
     /// A receiver that can be used in Body::wrap_stream,
     /// for streaming the request over the network.
-    Chunked(TokioReceiver<Result<Frame<Bytes>, hyper::Error>>),
+    Chunked(TokioReceiver<Result<Bytes, std::io::Error>>),
     /// A body whose bytes are buffered
     /// and sent in one chunk over the network.
     Buffered(UnboundedReceiver<BodyChunk>),
 }
 
-/// The sink side of the body passed to hyper,
+/// The sink side of the body passed to wreq,
 /// used to enqueue chunks.
 enum BodySink {
     /// A Tokio sender used to feed chunks to the network stream.
-    Chunked(TokioSender<Result<Frame<Bytes>, hyper::Error>>),
+    Chunked(TokioSender<Result<Bytes, std::io::Error>>),
     /// A Crossbeam sender used to send chunks to the fetch worker,
     /// where they will be buffered
     /// in order to ensure they are not streamed them over the network.
@@ -460,9 +456,7 @@ impl BodySink {
             BodySink::Chunked(sender) => {
                 let sender = sender.clone();
                 spawn_task(async move {
-                    let _ = sender
-                        .send(Ok(Frame::data(Bytes::copy_from_slice(&bytes))))
-                        .await;
+                    let _ = sender.send(Ok(Bytes::copy_from_slice(&bytes))).await;
                 });
             },
             BodySink::Buffered(sender) => {
@@ -508,7 +502,6 @@ const FRAGMENT: &AsciiSet = &CONTROLS.add(b'|').add(b'{').add(b'}');
 #[servo_tracing::instrument(skip_all, fields(url=url.as_str()))]
 /// This sets up the callback infrastructure to send body frames to `body_sender` and fires the client request.
 async fn obtain_response(
-    client: &ServoClient,
     url: &ServoUrl,
     method: &Method,
     request_headers: &mut HeaderMap,
@@ -528,8 +521,11 @@ async fn obtain_response(
 
     // https://url.spec.whatwg.org/#percent-encoded-bytes
     let encoded_url = utf8_percent_encode(url.as_str(), FRAGMENT).to_string();
+    let is_secure_scheme = url.is_secure_scheme();
 
-    let request = if let Some(chunk_requester) = body_sender {
+    // Request body: the IPC body pump is unchanged; only the sink item type
+    // narrowed from hyper frames to bytes.
+    let request_body: Option<wreq::Body> = if let Some(chunk_requester) = body_sender {
         let (sink, stream) = if source_is_null {
             // Step 4.2 of https://fetch.spec.whatwg.org/#concept-http-network-fetch
             // TODO: this should not be set for HTTP/2(currently not supported?).
@@ -538,10 +534,10 @@ async fn obtain_response(
             let (sender, receiver) = channel(1);
             (BodySink::Chunked(sender), BodyStream::Chunked(receiver))
         } else {
-            // Note: Hyper seems to already buffer bytes when the request appears not stream-able,
+            // Note: wreq's hyper buffers bytes when the request appears not stream-able,
             // see https://github.com/hyperium/hyper/issues/2232#issuecomment-644322104
             //
-            // However since this doesn't appear documented, and we're using an ancient version,
+            // However since this doesn't appear documented,
             // for now we buffer manually to ensure we don't stream requests
             // to servers that might not know how to handle them.
             let (sender, receiver) = unbounded_channel();
@@ -555,10 +551,9 @@ async fn obtain_response(
             fetch_terminated,
         )?;
 
-        let body = match stream {
+        match stream {
             BodyStream::Chunked(receiver) => {
-                let stream = ReceiverStream::new(receiver);
-                BoxBody::new(http_body_util::StreamBody::new(stream))
+                Some(wreq::Body::wrap_stream(ReceiverStream::new(receiver)))
             },
             BodyStream::Buffered(mut receiver) => {
                 // Accumulate bytes received over IPC into a vector.
@@ -572,22 +567,11 @@ async fn obtain_response(
                         None => warn!("Failed to read all chunks from request body."),
                     }
                 }
-                Full::new(body.into()).map_err(|_| unreachable!()).boxed()
+                Some(wreq::Body::from(body))
             },
-        };
-        HyperRequest::builder()
-            .method(method)
-            .uri(encoded_url)
-            .body(body)
+        }
     } else {
-        HyperRequest::builder()
-            .method(method)
-            .uri(encoded_url)
-            .body(
-                http_body_util::Empty::new()
-                    .map_err(|_| unreachable!())
-                    .boxed(),
-            )
+        None
     };
 
     // TODO(#21261) connect_start: set if a persistent connection is *not* used and the last non-redirected
@@ -607,12 +591,6 @@ async fn obtain_response(
             .set_attribute(ResourceAttribute::SecureConnectionStart);
     }
 
-    let mut request = match request {
-        Ok(request) => request,
-        Err(error) => return Err(NetworkError::HttpError(error.to_string())),
-    };
-    *request.headers_mut() = headers.clone();
-
     let connect_end = CrossProcessInstant::now();
     context
         .timing
@@ -623,11 +601,7 @@ async fn obtain_response(
     let closure_url = url.clone();
     let method = method.clone();
     let send_start = CrossProcessInstant::now();
-
-    let host = request.uri().host().unwrap_or("").to_owned();
-    let override_manager = context.state.override_manager.clone();
-    let headers = headers.clone();
-    let is_secure_scheme = url.is_secure_scheme();
+    let headers_for_devtools = headers.clone();
 
     // Generally, we use a persistent connection, so we will also set other PerformanceResourceTiming
     //   attributes to this as well (domain_lookup_start, domain_lookup_end, connect_start, connect_end,
@@ -636,68 +610,97 @@ async fn obtain_response(
         .timing
         .set_attribute(ResourceAttribute::RequestStart);
 
-    let client_future = client
-        .request(request)
-        .and_then(move |res| {
-            let send_end = CrossProcessInstant::now();
-
-            // TODO(#21271) response_start: immediately after receiving first byte of response
-
-            let msg = if let Some(request_id) = request_id {
-                if let Some(pipeline_id) = pipeline_id {
-                    if let Some(browsing_context_id) = browsing_context_id {
-                        Some(prepare_devtools_request(
-                            request_id,
-                            closure_url,
-                            method.clone(),
-                            headers,
-                            Some(devtools_bytes.lock().clone()),
-                            pipeline_id,
-                            (connect_end - connect_start).unsigned_abs(),
-                            (send_end - send_start).unsigned_abs(),
-                            destination,
-                            is_xhr,
-                            browsing_context_id,
-                        ))
-                    } else {
-                        debug!("Not notifying devtools (no browsing_context_id)");
-                        None
-                    }
-                    // TODO: ^This is not right, connect_start is taken before contructing the
-                    // request and connect_end at the end of it. send_start is takend before the
-                    // connection too. I'm not sure it's currently possible to get the time at the
-                    // point between the connection and the start of a request.
-                } else {
-                    debug!("Not notifying devtools (no pipeline_id)");
-                    None
-                }
-            } else {
-                debug!("Not notifying devtools (no request_id)");
-                None
-            };
-
-            future::ready(Ok((
-                Decoder::detect(res.map(|r| r.boxed()), is_secure_scheme),
-                msg,
-            )))
-        })
-        .map_err(move |error| {
-            warn!("network error: {error:?}");
-            NetworkError::from_hyper_error(
-                &error,
-                override_manager.remove_certificate_failing_verification(host.as_str()),
-            )
-        });
+    let mut request_builder = context
+        .state
+        .wreq_client
+        .request(method.clone(), encoded_url.as_str())
+        .headers(headers)
+        // Servo's fetch pipeline owns redirects (http_redirect_fetch,
+        // 20-hop cap) — the internal transport must never follow one itself.
+        .redirect(wreq::redirect::Policy::none())
+        // Cookie steps run servo-side on the shared jar; wreq's cookie
+        // layer must stay silent on internal loads.
+        .cookie_provider(StdArc::new(cookie_jar::NoopStore))
+        // Compression stays servo-owned (Accept-Encoding is set by
+        // set_default_accept_encoding; decoding happens in Decoder::detect)
+        // so page-visible Content-Encoding/Content-Length do not change.
+        .gzip(false)
+        .brotli(false)
+        .deflate(false)
+        .zstd(false);
+    if let Some(body) = request_body {
+        request_builder = request_builder.body(body);
+    }
 
     #[cfg(feature = "tracing")]
-    {
-        client_future.instrument(trace_span!("HyperRequest")).await
-    }
-
+    let send_span = trace_span!("wreqRequest");
+    #[cfg(feature = "tracing")]
+    let sent = request_builder.send().instrument(send_span);
     #[cfg(not(feature = "tracing"))]
-    {
-        client_future.await
+    let sent = request_builder.send();
+
+    let wreq_response = sent
+        .await
+        .map_err(|error| {
+            warn!("network error: {error:?}");
+            NetworkError::HttpError(error.to_string())
+        })?;
+
+    let send_end = CrossProcessInstant::now();
+
+    // TODO(#21271) response_start: immediately after receiving first byte of response
+
+    let msg = if let Some(request_id) = request_id {
+        if let Some(pipeline_id) = pipeline_id {
+            if let Some(browsing_context_id) = browsing_context_id {
+                Some(prepare_devtools_request(
+                    request_id,
+                    closure_url,
+                    method.clone(),
+                    headers_for_devtools,
+                    Some(devtools_bytes.lock().clone()),
+                    pipeline_id,
+                    (connect_end - connect_start).unsigned_abs(),
+                    (send_end - send_start).unsigned_abs(),
+                    destination,
+                    is_xhr,
+                    browsing_context_id,
+                ))
+            } else {
+                debug!("Not notifying devtools (no browsing_context_id)");
+                None
+            }
+            // TODO: ^This is not right, connect_start is taken before contructing the
+            // request and connect_end at the end of it. send_start is takend before the
+            // connection too. I'm not sure it's currently possible to get the time at the
+            // point between the connection and the start of a request.
+        } else {
+            debug!("Not notifying devtools (no pipeline_id)");
+            None
+        }
+    } else {
+        debug!("Not notifying devtools (no request_id)");
+        None
+    };
+
+    let response = wreq_response_to_boxed(wreq_response);
+    Ok((Decoder::detect(response, is_secure_scheme), msg))
+}
+
+/// Convert a `wreq::Response` into a `HyperResponse<BoxedBody>` feeding
+/// servo's `Decoder` exactly where hyper's body used to enter.
+/// Bytes move; nothing is re-buffered. The stream's error type is
+/// `wreq::Error` (the `BoxedBody` alias) — the decoder boxes body errors
+/// into `BodyStreamError` regardless of their concrete type.
+fn wreq_response_to_boxed(response: wreq::Response) -> HyperResponse<BoxedBody> {
+    let mut builder = HyperResponse::builder().status(response.status());
+    for (name, value) in response.headers().iter() {
+        builder = builder.header(name, value);
     }
+    let stream = response.bytes_stream().map(|result| result.map(Frame::data));
+    builder
+        .body(BoxedBody::new(http_body_util::StreamBody::new(stream)))
+        .unwrap_or_else(|_| unreachable!("statically valid response"))
 }
 
 /// Setup the callback mechanism to forward chunks from the request received to the `chunk_requester`.
@@ -2202,7 +2205,6 @@ async fn http_network_fetch(
         // request’s current URL, includeCredentials, and newConnection.
         _ => {
             let response_future = obtain_response(
-                &context.state.client,
                 &url,
                 &request.method,
                 &mut request.headers,

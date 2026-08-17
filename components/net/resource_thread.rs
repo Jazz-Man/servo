@@ -50,9 +50,7 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::async_runtime::{init_async_runtime, spawn_task};
-use crate::connector::{
-    CACertificates, CertificateErrorOverrideManager, create_http_client, create_tls_config,
-};
+use crate::connector::{CACertificates, CertificateErrorOverrideManager};
 use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
@@ -162,8 +160,6 @@ pub fn new_core_resource_thread(
             let mut channel_manager = ResourceChannelManager {
                 resource_manager,
                 config_dir,
-                ca_certificates,
-                ignore_certificate_errors,
                 cancellation_listeners: Default::default(),
                 cookie_listeners: Default::default(),
             };
@@ -193,8 +189,6 @@ pub fn new_core_resource_thread(
 struct ResourceChannelManager {
     resource_manager: CoreResourceManager,
     config_dir: Option<PathBuf>,
-    ca_certificates: CACertificates<'static>,
-    ignore_certificate_errors: bool,
     cancellation_listeners: FxHashMap<RequestId, Weak<CancellationListener>>,
     cookie_listeners: FxHashMap<CookieStoreId, GenericCallback<CookieAsyncResponse>>,
 }
@@ -202,8 +196,6 @@ struct ResourceChannelManager {
 /// This returns a tuple HttpState and a private HttpState.
 fn create_http_states(
     config_dir: Option<&Path>,
-    ca_certificates: CACertificates<'static>,
-    ignore_certificate_errors: bool,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
@@ -220,9 +212,7 @@ fn create_http_states(
     // CoreResourceMsg::Exit).
     let (public_client, public_jar) = http_client.unwrap_or_else(|| {
         (
-            wreq::Client::builder()
-                .build()
-                .expect("wreq client construction cannot fail for default config"),
+            wreq::Client::new(),
             match config_dir {
                 Some(config_dir) => Arc::new(cookie_jar::Jar::with_persistence(150, config_dir)),
                 None => Arc::new(cookie_jar::Jar::new(150)),
@@ -233,9 +223,7 @@ fn create_http_states(
     // own cookie-less client — the injected client's provider points at the
     // PUBLIC jar, and the WS handshake (no per-request override exists
     // there) would otherwise let private traffic write the public jar.
-    let private_client = wreq::Client::builder()
-        .build()
-        .expect("wreq client construction cannot fail for default config");
+    let private_client = wreq::Client::new();
     let private_jar = Arc::new(cookie_jar::Jar::new(150));
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -245,11 +233,6 @@ fn create_http_states(
         auth_cache: RwLock::new(auth_cache),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: HttpCache::default(),
-        client: create_http_client(create_tls_config(
-            ca_certificates.clone(),
-            ignore_certificate_errors,
-            override_manager.clone(),
-        )),
         wreq_client: public_client,
         override_manager,
         embedder_proxy: embedder_proxy.clone(),
@@ -263,11 +246,6 @@ fn create_http_states(
         auth_cache: RwLock::new(AuthCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: HttpCache::default(),
-        client: create_http_client(create_tls_config(
-            ca_certificates,
-            ignore_certificate_errors,
-            override_manager.clone(),
-        )),
         wreq_client: private_client,
         override_manager,
         embedder_proxy,
@@ -289,13 +267,8 @@ impl ResourceChannelManager {
         embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
         http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
     ) {
-        let (public_http_state, private_http_state) = create_http_states(
-            self.config_dir.as_deref(),
-            self.ca_certificates.clone(),
-            self.ignore_certificate_errors,
-            embedder_proxy,
-            http_client,
-        );
+        let (public_http_state, private_http_state) =
+            create_http_states(self.config_dir.as_deref(), embedder_proxy, http_client);
 
         let mut rx_set = GenericReceiverSet::new();
         let private_id = rx_set.add(private_receiver);

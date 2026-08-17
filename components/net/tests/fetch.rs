@@ -51,8 +51,9 @@ use uuid::Uuid;
 use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
 use crate::{
     DEFAULT_USER_AGENT, create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver,
-    create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
-    make_ssl_server, mock_origin, new_fetch_context,
+    create_http_state, create_http_state_trusting_certs, fetch, fetch_with_context,
+    fetch_with_cors_cache, make_body, make_server, make_ssl_server, mock_origin,
+    new_fetch_context,
 };
 
 // TODO write a struct that impls Handler for storing test values
@@ -774,8 +775,13 @@ fn test_fetch_with_hsts() {
 
     let embedder_proxy = create_generic_embedder_proxy();
 
+    // The server certificate is self-signed. The wreq path has no
+    // cert-override hook, so trust the certificate at the client instead.
     let mut context = FetchContext {
-        state: Arc::new(create_http_state(None)),
+        state: Arc::new(create_http_state_trusting_certs(
+            None,
+            server.certificates.as_ref().unwrap(),
+        )),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
         filemanager: FileManager::new(
@@ -793,12 +799,6 @@ fn test_fetch_with_hsts() {
         preloaded_resources: Default::default(),
         in_flight_keep_alive_records: Default::default(),
     };
-
-    // The server certificate is self-signed, so we need to add an override
-    // so that the connection works properly.
-    for certificate in server.certificates.as_ref().unwrap().iter() {
-        context.state.override_manager.add_override(certificate);
-    }
 
     {
         let mut list = context.state.hsts_list.write();
@@ -938,13 +938,17 @@ fn test_fetch_self_signed() {
 
     let response = fetch_with_context(request, &mut context);
 
+    // The wreq transport surfaces TLS failures as plain HTTP network
+    // errors; the SslValidation variant (cert-override UX for embedders)
+    // lost its producer when the hyper connector was removed.
     assert!(matches!(
         response.get_network_error(),
-        Some(NetworkError::SslValidation(..))
+        Some(NetworkError::HttpError(..))
     ));
 
-    // The server certificate is self-signed, so we need to add an override
-    // so that the connection works properly.
+    // The override manager no longer feeds the HTTP path (it stays wired to
+    // the WebSocket connector only), so adding an override must NOT rescue
+    // the fetch: self-signed stays rejected on the internal path.
     for certificate in server.certificates.as_ref().unwrap().iter() {
         context.state.override_manager.add_override(certificate);
     }
@@ -960,7 +964,10 @@ fn test_fetch_self_signed() {
 
     let response = fetch_with_context(request, &mut context);
 
-    assert!(response.status.code().is_success());
+    assert!(matches!(
+        response.get_network_error(),
+        Some(NetworkError::HttpError(..))
+    ));
 
     let _ = server.close();
 }

@@ -2,10 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::hash_map::HashMap;
-use std::convert::TryFrom;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 use std::{fmt, io};
 
 use futures::task::{Context, Poll};
@@ -13,9 +10,7 @@ use futures::{Future, TryFutureExt};
 use http::uri::{Authority, Uri as Destination};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
-use hyper::rt::Executor;
 use hyper_rustls::{HttpsConnector as HyperRustlsHttpsConnector, MaybeHttpsStream};
-use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::client::legacy::connect::{
     Connected, Connection, HttpConnector as HyperHttpConnector,
@@ -32,7 +27,6 @@ use servo_config::pref;
 use tokio::net::TcpStream;
 use tower::Service;
 
-use crate::async_runtime::spawn_task;
 use crate::hosts::replace_host;
 
 pub const BUF_SIZE: usize = 32768;
@@ -43,16 +37,6 @@ pub const ALPN_H2: &str = "h2";
 #[derive(Clone)]
 pub struct ServoHttpConnector {
     inner: HyperHttpConnector,
-}
-
-impl ServoHttpConnector {
-    fn new() -> ServoHttpConnector {
-        let mut inner = HyperHttpConnector::new();
-        inner.enforce_http(false);
-        inner.set_happy_eyeballs_timeout(None);
-        inner.set_connect_timeout(Some(Duration::from_secs(pref!(network_connection_timeout))));
-        ServoHttpConnector { inner }
-    }
 }
 
 impl Service<Destination> for ServoHttpConnector {
@@ -312,22 +296,17 @@ where
     }
 }
 
-pub type Connector = InstrumentedConnector<ServoHttpConnector>;
 pub type TlsConfig = ClientConfig;
 
 #[derive(Clone, Debug, Default)]
 struct CertificateErrorOverrideManagerInternal {
-    /// A mapping of certificates and their hosts, which have seen certificate errors.
-    /// This is used to later create an override in this [CertificateErrorOverrideManager].
-    certificates_failing_to_verify: HashMap<ServerName<'static>, CertificateDer<'static>>,
     /// A list of certificates that should be accepted despite encountering verification
     /// errors.
     overrides: Vec<CertificateDer<'static>>,
 }
 
-/// This data structure is used to track certificate verification errors and overrides.
+/// This data structure is used to track certificate overrides.
 /// It tracks:
-///  - A list of [Certificate]s with verification errors mapped by their [ServerName]
 ///  - A list of [Certificate]s for which to ignore verification errors.
 #[derive(Clone, Debug, Default)]
 pub struct CertificateErrorOverrideManager(Arc<Mutex<CertificateErrorOverrideManagerInternal>>);
@@ -341,26 +320,6 @@ impl CertificateErrorOverrideManager {
     /// validation errors.
     pub fn add_override(&self, certificate: &CertificateDer<'static>) {
         self.0.lock().overrides.push(certificate.clone());
-    }
-
-    /// Given the a string representation of a sever host name, remove information about
-    /// a [Certificate] with verification errors. If a certificate with
-    /// verification errors was found, return it, otherwise None.
-    pub(crate) fn remove_certificate_failing_verification(
-        &self,
-        host: &str,
-    ) -> Option<CertificateDer<'static>> {
-        let server_name = match ServerName::try_from(host) {
-            Ok(name) => name.to_owned(),
-            Err(error) => {
-                warn!("Could not convert host string into RustTLS ServerName: {error:?}");
-                return None;
-            },
-        };
-        self.0
-            .lock()
-            .certificates_failing_to_verify
-            .remove(&server_name)
     }
 }
 
@@ -394,18 +353,6 @@ pub fn create_tls_config(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth()
-}
-
-#[derive(Clone)]
-struct TokioExecutor {}
-
-impl<F> Executor<F> for TokioExecutor
-where
-    F: Future<Output = ()> + 'static + std::marker::Send,
-{
-    fn execute(&self, fut: F) {
-        spawn_task(fut);
-    }
 }
 
 static CRYPTO_PROVIDER_CACHE: LazyLock<Arc<CryptoProvider>> = LazyLock::new(|| {
@@ -580,16 +527,11 @@ impl rustls::client::danger::ServerCertVerifier for CertificateVerificationOverr
                 return Ok(rustls::client::danger::ServerCertVerified::assertion());
             }
         }
-        self.override_manager
-            .0
-            .lock()
-            .certificates_failing_to_verify
-            .insert(server_name.to_owned(), end_entity.clone().into_owned());
         Err(error)
     }
 }
 
-pub type BoxedBody = BoxBody<Bytes, hyper::Error>;
+pub type BoxedBody = BoxBody<Bytes, wreq::Error>;
 
 #[derive(Debug)]
 /// The error type for the MaybeProxyConnector
@@ -615,19 +557,6 @@ pub struct ProxyConnector {
     client: ServoHttpConnector,
     /// Matcher to see if we should forward to the proxy or not.
     matcher: std::sync::Arc<hyper_util::client::proxy::matcher::Matcher>,
-}
-
-impl ProxyConnector {
-    fn new() -> Self {
-        let matcher_builder = hyper_util::client::proxy::matcher::Matcher::builder()
-            .http(servo_config::pref!(network_http_proxy_uri))
-            .https(servo_config::pref!(network_https_proxy_uri))
-            .no(servo_config::pref!(network_http_no_proxy));
-        ProxyConnector {
-            client: ServoHttpConnector::new(),
-            matcher: std::sync::Arc::new(matcher_builder.build()),
-        }
-    }
 }
 
 // Just forward everything to the inner type except that we modify the errors returned.
@@ -663,19 +592,4 @@ impl Service<Destination> for ProxyConnector {
             ),
         }
     }
-}
-
-pub type ServoClient = Client<InstrumentedConnector<ProxyConnector>, BoxedBody>;
-
-pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .wrap_connector(ProxyConnector::new());
-
-    Client::builder(TokioExecutor {})
-        .http1_title_case_headers(true)
-        .build(InstrumentedConnector::from(connector))
 }
