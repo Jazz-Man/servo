@@ -52,7 +52,7 @@ use net_traits::request::{
 };
 use net_traits::response::{CacheState, RedirectTaint, Response, ResponseBody, ResponseType};
 use net_traits::{
-    CookieSource, DOCUMENT_ACCEPT_HEADER_VALUE, DiscardFetch, NetworkError, RedirectEndValue,
+    DOCUMENT_ACCEPT_HEADER_VALUE, DiscardFetch, NetworkError, RedirectEndValue,
     RedirectStartValue, ReferrerPolicy, ResourceAttribute, ResourceFetchTimingContainer,
     ResourceTimeValue, TlsSecurityInfo, TlsSecurityState,
 };
@@ -79,8 +79,6 @@ use crate::async_runtime::spawn_task;
 use crate::connector::{
     CertificateErrorOverrideManager, ServoClient, TlsHandshakeInfo, create_tls_config,
 };
-use crate::cookie::ServoCookie;
-use crate::cookie_storage::CookieStorage;
 use crate::decoder::Decoder;
 use crate::devtools::{
     prepare_devtools_request, send_request_to_devtools, send_response_values_to_devtools,
@@ -111,13 +109,25 @@ pub enum HttpCacheEntryState {
 
 pub struct HttpState {
     pub hsts_list: RwLock<HstsList>,
-    pub cookie_jar: RwLock<CookieStorage>,
+    pub cookie_jar: StdArc<cookie_jar::Jar>,
     pub http_cache: HttpCache,
     pub auth_cache: RwLock<AuthCache>,
     pub history_states: RwLock<FxHashMap<HistoryStateId, Vec<u8>>>,
     pub client: ServoClient,
+    // The embedder-injected wreq client; cohabits with `client` until the
+    // hyper stack is removed. Nothing consumes it yet.
+    pub wreq_client: wreq::Client,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+}
+
+/// Fork-side source mapping (an orphan-rule `From` impl would force a
+/// `cookie-jar` dependency on `net_traits`).
+pub(crate) fn to_jar_source(source: net_traits::CookieSource) -> cookie_jar::CookieSource {
+    match source {
+        net_traits::CookieSource::HTTP => cookie_jar::CookieSource::Http,
+        net_traits::CookieSource::NonHTTP => cookie_jar::CookieSource::NonHttp,
+    }
 }
 
 impl HttpState {
@@ -333,37 +343,31 @@ pub fn determine_requests_referrer(
     }
 }
 
-fn set_request_cookies(
-    url: &ServoUrl,
-    headers: &mut HeaderMap,
-    cookie_jar: &RwLock<CookieStorage>,
-) {
-    let mut cookie_jar = cookie_jar.write();
-    cookie_jar.remove_expired_cookies_for_url(url);
-    if let Some(cookie_list) = cookie_jar.cookies_for_url(url, CookieSource::HTTP) &&
+fn set_request_cookies(url: &ServoUrl, headers: &mut HeaderMap, cookie_jar: &cookie_jar::Jar) {
+    if let Some(cookie_list) =
+        cookie_jar.cookies_for_url(url.as_url(), cookie_jar::CookieSource::Http) &&
         let Ok(cookie_list_header_value) = HeaderValue::from_bytes(cookie_list.as_bytes())
     {
         headers.insert(header::COOKIE, cookie_list_header_value);
     }
 }
 
-fn set_cookie_for_url(cookie_jar: &RwLock<CookieStorage>, request: &ServoUrl, cookie_val: &str) {
-    let mut cookie_jar = cookie_jar.write();
-    let source = CookieSource::HTTP;
-
-    if let Some(cookie) = ServoCookie::from_cookie_string(cookie_val, request, source) {
-        cookie_jar.push(cookie, request, source);
-    }
+fn set_cookie_for_url(cookie_jar: &cookie_jar::Jar, request: &ServoUrl, cookie_val: &str) {
+    cookie_jar.set_cookie_string(
+        request.as_url(),
+        cookie_val,
+        cookie_jar::CookieSource::Http,
+    );
 }
 
 fn set_cookies_from_headers(
     url: &ServoUrl,
     headers: &HeaderMap,
-    cookie_jar: &RwLock<CookieStorage>,
+    cookie_jar: &cookie_jar::Jar,
 ) {
     for cookie in headers.get_all(header::SET_COOKIE) {
         let cookie_bytes = cookie.as_bytes();
-        if !ServoCookie::is_valid_name_or_value(cookie_bytes) {
+        if !cookie_jar::StoredCookie::is_valid_name_or_value(cookie_bytes) {
             continue;
         }
         if let Ok(cookie_str) = std::str::from_utf8(cookie_bytes) {

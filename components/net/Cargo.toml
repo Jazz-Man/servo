@@ -30,6 +30,7 @@ chrono = { workspace = true }
 content-security-policy = { workspace = true }
 cookie = { workspace = true }
 crossbeam-channel = { workspace = true }
+cookie-jar = { path = "../../../../crates/cookie-jar" }
 data-url = { workspace = true }
 devtools_traits = { workspace = true }
 embedder_traits = { workspace = true }
@@ -88,6 +89,7 @@ url = { workspace = true }
 uuid = { workspace = true }
 webpki-roots = { workspace = true }
 webrender_api = { workspace = true }
+wreq = { path = "../../../wreq", features = ["brotli", "charset", "cookies", "deflate", "form", "gzip", "json", "multipart", "parking_lot", "query", "socks", "stream", "tracing", "ws", "zstd"] }
 
 [dev-dependencies]
 flate2 = { workspace = true }

@@ -887,6 +887,10 @@ impl Servo {
         let preferences = builder.preferences.map(|opts| *opts);
         servo_config::prefs::set(preferences.unwrap_or_default());
 
+        // The embedder-injected HTTP client and shared cookie jar, moved into
+        // the resource thread below.
+        let http_client = builder.http_client;
+
         use std::sync::atomic::Ordering;
 
         style::context::DEFAULT_DISABLE_STYLE_SHARING_CACHE.store(
@@ -970,6 +974,7 @@ impl Servo {
                 opts.certificate_path.clone(),
                 opts.ignore_certificate_errors,
                 protocols.clone(),
+                http_client,
             );
 
         let (private_storage_threads, public_storage_threads) = new_storage_threads(
@@ -1408,6 +1413,7 @@ pub struct ServoBuilder {
     preferences: Option<Box<Preferences>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
+    http_client: Option<(wreq::Client, std::sync::Arc<cookie_jar::Jar>)>,
 }
 
 impl Default for ServoBuilder {
@@ -1417,6 +1423,7 @@ impl Default for ServoBuilder {
             preferences: Default::default(),
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
+            http_client: None,
         }
     }
 }
@@ -1443,6 +1450,20 @@ impl ServoBuilder {
 
     pub fn protocol_registry(mut self, protocol_registry: ProtocolRegistry) -> Self {
         self.protocol_registry = protocol_registry;
+        self
+    }
+
+    /// Inject the embedder's HTTP client and shared cookie jar. When absent,
+    /// the resource thread builds an unconfigured `wreq::Client` and loads
+    /// the jar from the config dir — production embedders inject their
+    /// identity here so plain-verb and engine loads share one client.
+    #[must_use]
+    pub fn http_client(
+        mut self,
+        client: wreq::Client,
+        cookie_jar: std::sync::Arc<cookie_jar::Jar>,
+    ) -> Self {
+        self.http_client = Some((client, cookie_jar));
         self
     }
 }

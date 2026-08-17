@@ -2,25 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use net::cookie::ServoCookie;
-use net::cookie_storage::CookieStorage;
-use net_traits::CookieSource;
-use servo_url::ServoUrl;
+use cookie_jar::{CookieSource, CookieStorage, StoredCookie};
+use url::Url;
 
 fn run(set_location: &str, set_cookies: &[&str], final_location: &str) -> String {
     let mut storage = CookieStorage::new(150);
-    let url = ServoUrl::parse(set_location).unwrap();
-    let source = CookieSource::HTTP;
+    let url = Url::parse(set_location).unwrap();
+    let source = CookieSource::Http;
 
     // Add all cookies to the store
     for str_cookie in set_cookies {
-        if let Some(cookie) = ServoCookie::from_cookie_string(str_cookie, &url, source) {
+        if let Some(cookie) = StoredCookie::from_cookie_string(str_cookie, &url, source) {
             storage.push(cookie, &url, source);
         }
     }
 
     // Get cookies for the test location
-    let url = ServoUrl::parse(final_location).unwrap();
+    let url = Url::parse(final_location).unwrap();
     storage
         .cookies_for_url(&url, source)
         .unwrap_or("".to_string())

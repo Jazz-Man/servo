@@ -27,8 +27,8 @@ use net_traits::response::{Response, ResponseInit};
 use net_traits::{
     AsyncRuntime, CookieAsyncResponse, CookieData, CookieSource, CoreResourceMsg,
     CoreResourceThread, CustomResponseMediator, DiscardFetch, FetchChannels, FetchTaskTarget,
-    NetworkError, ResourceFetchTiming, ResourceThreads, ResourceTimingType, WebSocketDomAction,
-    WebSocketNetworkEvent,
+    NetworkError, ResourceFetchTiming, ResourceThreads, ResourceTimingType, SiteDescriptor,
+    WebSocketDomAction, WebSocketNetworkEvent,
 };
 use parking_lot::{Mutex, RwLock};
 use profile_traits::mem::{
@@ -53,8 +53,6 @@ use crate::async_runtime::{init_async_runtime, spawn_task};
 use crate::connector::{
     CACertificates, CertificateErrorOverrideManager, create_http_client, create_tls_config,
 };
-use crate::cookie::ServoCookie;
-use crate::cookie_storage::CookieStorage;
 use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
@@ -66,7 +64,7 @@ use crate::fetch::methods::{
 use crate::filemanager_thread::FileManager;
 use crate::hsts::{self, HstsList};
 use crate::http_cache::HttpCache;
-use crate::http_loader::{HttpState, http_redirect_fetch};
+use crate::http_loader::{HttpState, http_redirect_fetch, to_jar_source};
 use crate::protocols::ProtocolRegistry;
 use crate::request_interceptor::RequestInterceptor;
 use crate::websocket_loader::create_handshake_request;
@@ -95,6 +93,7 @@ pub fn new_resource_threads(
     certificate_path: Option<String>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
+    http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
 ) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
     // Initialize the async runtime, and get a handle to it for use in clean shutdown.
     let async_runtime = init_async_runtime();
@@ -116,6 +115,7 @@ pub fn new_resource_threads(
         ca_certificates,
         ignore_certificate_errors,
         protocols,
+        http_client,
     );
     (
         ResourceThreads::new(public_core),
@@ -135,6 +135,7 @@ pub fn new_core_resource_thread(
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
+    http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
 ) -> (CoreResourceThread, CoreResourceThread) {
     let (public_setup_chan, public_setup_port) = generic_channel::channel().unwrap();
     let (private_setup_chan, private_setup_port) = generic_channel::channel().unwrap();
@@ -177,6 +178,7 @@ pub fn new_core_resource_thread(
                         refresh_receiver,
                         protocols,
                         embedder_proxy,
+                        http_client,
                     )
                 },
                 String::from("network-cache-reporter"),
@@ -203,20 +205,43 @@ fn create_http_states(
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
     let mut hsts_list = HstsList::default();
     let mut auth_cache = AuthCache::default();
-    let mut cookie_jar = CookieStorage::new(150);
     if let Some(config_dir) = config_dir {
         servo_base::read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
         servo_base::read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
-        servo_base::read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
     }
+
+    // Public state: the embedder-injected client and shared jar, or the
+    // fallback — a default client plus the persisted jar from the config
+    // dir (loads cookie_jar.json best-effort; save happens on
+    // CoreResourceMsg::Exit).
+    let (public_client, public_jar) = http_client.unwrap_or_else(|| {
+        (
+            wreq::Client::builder()
+                .build()
+                .expect("wreq client construction cannot fail for default config"),
+            match config_dir {
+                Some(config_dir) => Arc::new(cookie_jar::Jar::with_persistence(150, config_dir)),
+                None => Arc::new(cookie_jar::Jar::new(150)),
+            },
+        )
+    });
+    // Private state: its own ephemeral jar (channel-selected today) AND its
+    // own cookie-less client — the injected client's provider points at the
+    // PUBLIC jar, and the WS handshake (no per-request override exists
+    // there) would otherwise let private traffic write the public jar.
+    let private_client = wreq::Client::builder()
+        .build()
+        .expect("wreq client construction cannot fail for default config");
+    let private_jar = Arc::new(cookie_jar::Jar::new(150));
 
     let override_manager = CertificateErrorOverrideManager::new();
     let http_state = HttpState {
         hsts_list: RwLock::new(hsts_list),
-        cookie_jar: RwLock::new(cookie_jar),
+        cookie_jar: public_jar,
         auth_cache: RwLock::new(auth_cache),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: HttpCache::default(),
@@ -225,6 +250,7 @@ fn create_http_states(
             ignore_certificate_errors,
             override_manager.clone(),
         )),
+        wreq_client: public_client,
         override_manager,
         embedder_proxy: embedder_proxy.clone(),
     };
@@ -232,7 +258,8 @@ fn create_http_states(
     let override_manager = CertificateErrorOverrideManager::new();
     let private_http_state = HttpState {
         hsts_list: RwLock::new(HstsList::default()),
-        cookie_jar: RwLock::new(CookieStorage::new(150)),
+        // Private browsing: ephemeral jar, no persistence (save() is a no-op).
+        cookie_jar: private_jar,
         auth_cache: RwLock::new(AuthCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: HttpCache::default(),
@@ -241,6 +268,7 @@ fn create_http_states(
             ignore_certificate_errors,
             override_manager.clone(),
         )),
+        wreq_client: private_client,
         override_manager,
         embedder_proxy,
     };
@@ -259,12 +287,14 @@ impl ResourceChannelManager {
         refresh_receiver: GenericReceiver<CoreResourceMsg>,
         protocols: Arc<ProtocolRegistry>,
         embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+        http_client: Option<(wreq::Client, Arc<cookie_jar::Jar>)>,
     ) {
         let (public_http_state, private_http_state) = create_http_states(
             self.config_dir.as_deref(),
             self.ca_certificates.clone(),
             self.ignore_certificate_errors,
             embedder_proxy,
+            http_client,
         );
 
         let mut rx_set = GenericReceiverSet::new();
@@ -454,38 +484,26 @@ impl ResourceChannelManager {
                 }
             },
             CoreResourceMsg::DeleteCookiesForSites(sites, sender) => {
-                http_state
-                    .cookie_jar
-                    .write()
-                    .delete_cookies_for_sites(&sites);
+                http_state.cookie_jar.delete_cookies_for_site_names(sites);
                 let _ = sender.send(());
             },
             CoreResourceMsg::DeleteSessionCookies(sender) => {
-                http_state.cookie_jar.write().clear_session_cookies();
+                http_state.cookie_jar.clear_session_cookies();
                 let _ = sender.send(());
             },
             CoreResourceMsg::DeleteCookies(request, sender) => {
-                http_state
-                    .cookie_jar
-                    .write()
-                    .clear_storage(request.as_ref());
+                http_state.cookie_jar.delete_all(request.as_ref().map(ServoUrl::as_url));
                 if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
                 return true;
             },
             CoreResourceMsg::DeleteCookie(request, name) => {
-                http_state
-                    .cookie_jar
-                    .write()
-                    .delete_cookie_with_name(&request, name);
+                http_state.cookie_jar.delete_cookie(request.as_url(), &name);
                 return true;
             },
             CoreResourceMsg::DeleteCookieAsync(cookie_store_id, url, name) => {
-                http_state
-                    .cookie_jar
-                    .write()
-                    .delete_cookie_with_name(&url, name);
+                http_state.cookie_jar.delete_cookie(url.as_url(), &name);
                 self.send_cookie_response(cookie_store_id, CookieData::Delete(Ok(())));
             },
             CoreResourceMsg::FetchRedirect(request_builder, res_init, sender) => {
@@ -531,44 +549,43 @@ impl ResourceChannelManager {
                 self.send_cookie_response(cookie_store_id, CookieData::Set(Ok(())));
             },
             CoreResourceMsg::GetCookieStringForUrl(url, consumer, source) => {
-                let mut cookie_jar = http_state.cookie_jar.write();
-                cookie_jar.remove_expired_cookies_for_url(&url);
-                consumer.send_or_ignore(cookie_jar.cookies_for_url(&url, source));
+                consumer.send_or_ignore(
+                    http_state
+                        .cookie_jar
+                        .cookies_for_url(url.as_url(), to_jar_source(source)),
+                );
             },
             CoreResourceMsg::GetCookiesForUrl(url, consumer, source) => {
-                let mut cookie_jar = http_state.cookie_jar.write();
-                cookie_jar.remove_expired_cookies_for_url(&url);
-                let cookies = cookie_jar
-                    .cookies_data_for_url(&url, source)
+                let cookies = http_state
+                    .cookie_jar
+                    .cookies_data_for_url_sourced(url.as_url(), to_jar_source(source))
+                    .into_iter()
                     .map(Serde)
                     .collect();
                 consumer.send_or_ignore(cookies);
             },
             CoreResourceMsg::GetCookieDataForUrlAsync(cookie_store_id, url, name) => {
-                let mut cookie_jar = http_state.cookie_jar.write();
-                cookie_jar.remove_expired_cookies_for_url(&url);
-                let cookie = cookie_jar
-                    .query_cookies(&url, name)
+                let cookie = http_state
+                    .cookie_jar
+                    .query_cookies(url.as_url(), name)
                     .into_iter()
                     .map(Serde)
                     .next();
                 self.send_cookie_response(cookie_store_id, CookieData::Get(cookie));
             },
             CoreResourceMsg::GetAllCookieDataForUrlAsync(cookie_store_id, url, name) => {
-                let mut cookie_jar = http_state.cookie_jar.write();
-                cookie_jar.remove_expired_cookies_for_url(&url);
-                let cookies = cookie_jar
-                    .query_cookies(&url, name)
+                let cookies = http_state
+                    .cookie_jar
+                    .query_cookies(url.as_url(), name)
                     .into_iter()
                     .map(Serde)
                     .collect();
                 self.send_cookie_response(cookie_store_id, CookieData::GetAll(cookies));
             },
             CoreResourceMsg::EmbedderGetCookiesForUrl(operation_id, url, source) => {
-                let mut cookie_jar = http_state.cookie_jar.write();
-                cookie_jar.remove_expired_cookies_for_url(&url);
-                let cookies: Vec<Cookie<'static>> =
-                    cookie_jar.cookies_data_for_url(&url, source).collect();
+                let cookies: Vec<Cookie<'static>> = http_state
+                    .cookie_jar
+                    .cookies_data_for_url_sourced(url.as_url(), to_jar_source(source));
                 http_state.embedder_proxy.send(
                     NetToEmbedderMsg::EmbedderCookieOperationResponseWithCookies(
                         operation_id,
@@ -590,7 +607,7 @@ impl ResourceChannelManager {
                     ));
             },
             CoreResourceMsg::EmbedderClearCookies(operation_id) => {
-                http_state.cookie_jar.write().clear_storage(None);
+                http_state.cookie_jar.delete_all(None);
                 http_state
                     .embedder_proxy
                     .send(NetToEmbedderMsg::EmbedderCookieOperationResponse(
@@ -598,7 +615,7 @@ impl ResourceChannelManager {
                     ));
             },
             CoreResourceMsg::EmbedderClearSessionCookies(operation_id) => {
-                http_state.cookie_jar.write().clear_session_cookies();
+                http_state.cookie_jar.clear_session_cookies();
                 http_state
                     .embedder_proxy
                     .send(NetToEmbedderMsg::EmbedderCookieOperationResponse(
@@ -618,9 +635,13 @@ impl ResourceChannelManager {
                     .insert(origin, mediator_chan);
             },
             CoreResourceMsg::ListCookies(sender) => {
-                let mut cookie_jar = http_state.cookie_jar.write();
-                cookie_jar.remove_all_expired_cookies();
-                sender.send_or_ignore(cookie_jar.cookie_site_descriptors());
+                let sites: Vec<SiteDescriptor> = http_state
+                    .cookie_jar
+                    .list_sites()
+                    .into_iter()
+                    .map(SiteDescriptor::new)
+                    .collect();
+                sender.send_or_ignore(sites);
             },
             CoreResourceMsg::GetHistoryState(history_state_id, consumer) => {
                 let history_states = http_state.history_states.read();
@@ -665,8 +686,9 @@ impl ResourceChannelManager {
                 if let Some(ref config_dir) = self.config_dir {
                     let auth_cache = http_state.auth_cache.read();
                     servo_base::write_json_to_file(&*auth_cache, config_dir, "auth_cache.json");
-                    let jar = http_state.cookie_jar.read();
-                    servo_base::write_json_to_file(&*jar, config_dir, "cookie_jar.json");
+                    if let Err(error) = http_state.cookie_jar.save() {
+                        eprintln!("Failed to save cookie jar: {error:?}");
+                    }
                     let hsts = http_state.hsts_list.read();
                     servo_base::write_json_to_file(&*hsts, config_dir, "hsts_list.json");
                 }
@@ -771,10 +793,10 @@ impl CoreResourceManager {
         source: CookieSource,
         http_state: &Arc<HttpState>,
     ) {
-        if let Some(cookie) = ServoCookie::new_wrapped(cookie, request, source) {
-            let mut cookie_jar = http_state.cookie_jar.write();
-            cookie_jar.push(cookie, request, source)
-        }
+        // Rejections stay silent (a cookie `new_wrapped` refuses is dropped).
+        http_state
+            .cookie_jar
+            .set_cookie(request.as_url(), cookie, to_jar_source(source));
     }
 
     fn fetch<Target: 'static + FetchTaskTarget + Send>(

@@ -94,6 +94,7 @@ webxr = [
 accesskit = { workspace = true }
 bitflags = { workspace = true }
 cookie = { workspace = true }
+cookie-jar = { path = "../../../../crates/cookie-jar" }
 crossbeam-channel = { workspace = true }
 devtools = { workspace = true }
 devtools_traits = { workspace = true }
@@ -151,6 +152,7 @@ webgpu = { workspace = true, optional = true }
 webrender = { workspace = true }
 webrender_api = { workspace = true }
 webxr-api = { workspace = true, optional = true }
+wreq = { path = "../../../wreq", features = ["brotli", "charset", "cookies", "deflate", "form", "gzip", "json", "multipart", "parking_lot", "query", "socks", "stream", "tracing", "ws", "zstd"] }
 
 # On most platforms we bake in the resources for simplicity. On ohos we load resources via the filesystem.
 # In the future we might want to use this approach also for the other platforms.

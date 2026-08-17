@@ -25,7 +25,7 @@ use http::header::{self, HeaderName, HeaderValue};
 use ipc_channel::ipc::IpcSender;
 use log::{debug, trace, warn};
 use net_traits::request::{RequestBuilder, RequestMode};
-use net_traits::{CookieSource, MessageData, WebSocketDomAction, WebSocketNetworkEvent};
+use net_traits::{MessageData, WebSocketDomAction, WebSocketNetworkEvent};
 use servo_base::generic_channel::CallbackSetter;
 use servo_url::ServoUrl;
 use tokio::net::TcpStream;
@@ -39,7 +39,6 @@ use tungstenite::{ClientRequestBuilder, Message};
 
 use crate::async_runtime::spawn_task;
 use crate::connector::TlsConfig;
-use crate::cookie::ServoCookie;
 use crate::hosts::replace_host;
 use crate::http_loader::HttpState;
 
@@ -101,9 +100,10 @@ pub fn create_handshake_request(
         headers.insert("Sec-WebSocket-Protocol", HeaderValue::from_str(&protocols)?);
     }
 
-    let mut cookie_jar = http_state.cookie_jar.write();
-    cookie_jar.remove_expired_cookies_for_url(&request.url);
-    if let Some(cookie_list) = cookie_jar.cookies_for_url(&request.url, CookieSource::HTTP) {
+    if let Some(cookie_list) = http_state
+        .cookie_jar
+        .cookies_for_url(request.url.as_url(), cookie_jar::CookieSource::Http)
+    {
         headers.insert("Cookie", HeaderValue::from_str(&cookie_list)?);
     }
 
@@ -138,18 +138,16 @@ fn process_ws_response(
         protocol_in_use = Some(protocol_name.to_string());
     }
 
-    let mut jar = http_state.cookie_jar.write();
     // TODO(eijebong): Replace thise once typed headers settled on a cookie impl
     for cookie in response.headers().get_all(header::SET_COOKIE) {
         let cookie_bytes = cookie.as_bytes();
-        if !ServoCookie::is_valid_name_or_value(cookie_bytes) {
+        if !cookie_jar::StoredCookie::is_valid_name_or_value(cookie_bytes) {
             continue;
         }
-        if let Ok(s) = std::str::from_utf8(cookie_bytes) &&
-            let Some(cookie) =
-                ServoCookie::from_cookie_string(s, resource_url, CookieSource::HTTP)
-        {
-            jar.push(cookie, resource_url, CookieSource::HTTP);
+        if let Ok(s) = std::str::from_utf8(cookie_bytes) {
+            http_state
+                .cookie_jar
+                .set_cookie_string(resource_url.as_url(), s, cookie_jar::CookieSource::Http);
         }
     }
 

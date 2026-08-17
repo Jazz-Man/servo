@@ -21,6 +21,7 @@ mod http_cache;
 mod http_loader;
 mod image_cache;
 mod resource_thread;
+mod runtime_bridge;
 mod subresource_integrity;
 use std::sync::Arc;
 
@@ -112,10 +113,11 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
     let override_manager = net::connector::CertificateErrorOverrideManager::new();
     HttpState {
         hsts_list: RwLock::new(net::hsts::HstsList::default()),
-        cookie_jar: RwLock::new(net::cookie_storage::CookieStorage::new(150)),
+        cookie_jar: std::sync::Arc::new(cookie_jar::Jar::new(150)),
         auth_cache: RwLock::new(net::resource_thread::AuthCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: net::http_cache::HttpCache::default(),
+        wreq_client: wreq::Client::builder().build().unwrap(),
         client: create_http_client(create_tls_config(
             net::connector::CACertificates::Default,
             false, /* ignore_certificate_errors */

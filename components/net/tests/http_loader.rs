@@ -28,8 +28,7 @@ use http::{HeaderName, Method, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
-use net::cookie::ServoCookie;
-use net::cookie_storage::CookieStorage;
+use cookie_jar::CookieSource;
 use net::fetch::methods::{self};
 use net::http_loader::{determine_requests_referrer, serialize_origin};
 use net::resource_thread::AuthCacheEntry;
@@ -41,8 +40,8 @@ use net_traits::request::{
     TraversableForUserPrompts, create_request_body_with_content,
 };
 use net_traits::response::{Response, ResponseBody};
-use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy, get_current_locale};
-use parking_lot::{Mutex, RwLock};
+use net_traits::{FetchTaskTarget, NetworkError, ReferrerPolicy, get_current_locale};
+use parking_lot::Mutex;
 use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use url::Url;
@@ -53,14 +52,9 @@ use crate::{
     replace_host_table, spawn_blocking_task,
 };
 
-fn assert_cookie_for_domain(
-    cookie_jar: &RwLock<CookieStorage>,
-    domain: &str,
-    cookie: Option<&str>,
-) {
-    let mut cookie_jar = cookie_jar.write();
-    let url = ServoUrl::parse(&*domain).unwrap();
-    let cookies = cookie_jar.cookies_for_url(&url, CookieSource::HTTP);
+fn assert_cookie_for_domain(cookie_jar: &cookie_jar::Jar, domain: &str, cookie: Option<&str>) {
+    let url = Url::parse(&*domain).unwrap();
+    let cookies = cookie_jar.cookies_for_url(&url, CookieSource::Http);
     assert_eq!(cookies.as_ref().map(|c| &**c), cookie);
 }
 
@@ -787,14 +781,11 @@ fn test_load_sets_requests_cookies_header_for_url_by_getting_cookies_from_the_re
     let mut context = new_fetch_context(None, None);
 
     {
-        let mut cookie_jar = context.state.cookie_jar.write();
-        let cookie = ServoCookie::new_wrapped(
+        context.state.cookie_jar.set_cookie(
+            url.as_url(),
             CookiePair::new("mozillaIs".to_owned(), "theBest".to_owned()),
-            &url,
-            CookieSource::HTTP,
-        )
-        .unwrap();
-        cookie_jar.push(cookie, &url, CookieSource::HTTP);
+            CookieSource::Http,
+        );
     }
 
     let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
@@ -837,14 +828,11 @@ fn test_load_sends_cookie_if_nonhttp() {
     let mut context = new_fetch_context(None, None);
 
     {
-        let mut cookie_jar = context.state.cookie_jar.write();
-        let cookie = ServoCookie::new_wrapped(
+        context.state.cookie_jar.set_cookie(
+            url.as_url(),
             CookiePair::new("mozillaIs".to_owned(), "theBest".to_owned()),
-            &url,
-            CookieSource::NonHTTP,
-        )
-        .unwrap();
-        cookie_jar.push(cookie, &url, CookieSource::HTTP);
+            CookieSource::NonHttp,
+        );
     }
 
     let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
@@ -916,10 +904,11 @@ fn test_cookie_set_with_httponly_should_not_be_available_using_getcookiesforurl(
         url.as_str(),
         Some("mozillaIs=theBest"),
     );
-    let mut cookie_jar = context.state.cookie_jar.write();
     assert!(
-        cookie_jar
-            .cookies_for_url(&url, CookieSource::NonHTTP)
+        context
+            .state
+            .cookie_jar
+            .cookies_for_url(url.as_url(), CookieSource::NonHttp)
             .is_none()
     );
 }
@@ -1362,23 +1351,17 @@ fn test_redirect_from_x_to_y_provides_y_cookies_from_y() {
 
     let mut context = new_fetch_context(None, None);
     {
-        let mut cookie_jar = context.state.cookie_jar.write();
-        let cookie_x = ServoCookie::new_wrapped(
+        context.state.cookie_jar.set_cookie(
+            url_x.as_url(),
             CookiePair::new("mozillaIsNot".to_owned(), "dotOrg".to_owned()),
-            &url_x,
-            CookieSource::HTTP,
-        )
-        .unwrap();
+            CookieSource::Http,
+        );
 
-        cookie_jar.push(cookie_x, &url_x, CookieSource::HTTP);
-
-        let cookie_y = ServoCookie::new_wrapped(
+        context.state.cookie_jar.set_cookie(
+            url_y.as_url(),
             CookiePair::new("mozillaIs".to_owned(), "theBest".to_owned()),
-            &url_y,
-            CookieSource::HTTP,
-        )
-        .unwrap();
-        cookie_jar.push(cookie_y, &url_y, CookieSource::HTTP);
+            CookieSource::Http,
+        );
     }
 
     let request = RequestBuilder::new(
