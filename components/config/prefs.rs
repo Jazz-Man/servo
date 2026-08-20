@@ -229,6 +229,9 @@ pub struct Preferences {
     pub dom_transient_activation_duration_ms: i64,
     // feature: Web Animations | #36950 | Web/API/Web_Animations_API
     pub dom_web_animations_enabled: bool,
+    /// Servo-internal WebDriver test hooks on Window — hidden unless a real
+    /// webdriver session needs them.
+    pub dom_webdriver_window_hooks_enabled: bool,
     /// Enable WebGL2 APIs.
     // feature: WebGL2 | #41394 | Web/API/WebGL2RenderingContext
     pub dom_webgl2_enabled: bool,
@@ -494,6 +497,7 @@ impl Preferences {
                 cfg!(target_env = "ohos"),
             dom_transient_activation_duration_ms: 5000,
             dom_web_animations_enabled: false,
+            dom_webdriver_window_hooks_enabled: false,
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),
