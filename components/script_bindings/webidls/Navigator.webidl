@@ -14,6 +14,7 @@ Navigator includes NavigatorContentUtils;
 Navigator includes NavigatorPlugins;
 Navigator includes NavigatorCookies;
 Navigator includes NavigatorConcurrentHardware;
+Navigator includes NavigatorAutomationInformation;
 
 // https://html.spec.whatwg.org/multipage/#navigatorid
 [Exposed=(Window,Worker)]
@@ -70,6 +71,18 @@ partial interface Navigator {
 // https://html.spec.whatwg.org/multipage/#navigatorconcurrenthardware
 interface mixin NavigatorConcurrentHardware {
   readonly attribute unsigned long long hardwareConcurrency;
+};
+
+// https://www.w3.org/TR/device-memory/#navigator-interface
+// Nullable beyond the spec's plain `double`: this embedder has no host value
+// to report, so a persona that leaves device memory unset gets null.
+partial interface Navigator {
+  readonly attribute double? deviceMemory;
+};
+
+// https://html.spec.whatwg.org/multipage/#navigatorautomationinformation
+interface mixin NavigatorAutomationInformation {
+  readonly attribute boolean webdriver;
 };
 
 // https://w3c.github.io/clipboard-apis/#navigator-interface

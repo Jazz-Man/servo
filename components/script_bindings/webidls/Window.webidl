@@ -137,12 +137,12 @@ partial interface Window {
 // WebDriver extensions
 partial interface Window {
   // Shouldn't be public, but just to make things work for now
-  undefined webdriverCallback(optional any result);
-  undefined webdriverException(optional any result);
-  Element? webdriverElement(DOMString id);
-  WindowProxy? webdriverFrame(DOMString id);
-  WindowProxy webdriverWindow(DOMString id);
-  ShadowRoot? webdriverShadowRoot(DOMString id);
+  [Pref="dom_webdriver_window_hooks_enabled"] undefined webdriverCallback(optional any result);
+  [Pref="dom_webdriver_window_hooks_enabled"] undefined webdriverException(optional any result);
+  [Pref="dom_webdriver_window_hooks_enabled"] Element? webdriverElement(DOMString id);
+  [Pref="dom_webdriver_window_hooks_enabled"] WindowProxy? webdriverFrame(DOMString id);
+  [Pref="dom_webdriver_window_hooks_enabled"] WindowProxy webdriverWindow(DOMString id);
+  [Pref="dom_webdriver_window_hooks_enabled"] ShadowRoot? webdriverShadowRoot(DOMString id);
 };
 
 // https://html.spec.whatwg.org/multipage/#dom-sessionstorage

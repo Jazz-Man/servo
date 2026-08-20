@@ -42,25 +42,34 @@ pub(crate) fn AppCodeName() -> DOMString {
 #[expect(non_snake_case)]
 #[cfg(target_os = "windows")]
 pub(crate) fn Platform() -> DOMString {
-    DOMString::from("Win32")
+    platform("Win32")
 }
 
 #[expect(non_snake_case)]
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "freebsd"))]
 pub(crate) fn Platform() -> DOMString {
-    DOMString::from("Linux")
+    platform("Linux")
 }
 
 #[expect(non_snake_case)]
 #[cfg(target_os = "macos")]
 pub(crate) fn Platform() -> DOMString {
-    DOMString::from("Mac")
+    platform("Mac")
 }
 
 #[expect(non_snake_case)]
 #[cfg(target_os = "ios")]
 pub(crate) fn Platform() -> DOMString {
-    DOMString::from("iOS")
+    platform("iOS")
+}
+
+/// Persona-first platform: the installed persona's platform, or the per-OS
+/// fallback passed by the `cfg`-selected [`Platform`] above.
+fn platform(fallback: &str) -> DOMString {
+    match servo_config::persona::get() {
+        Some(persona) => DOMString::from(persona.platform),
+        None => DOMString::from(fallback),
+    }
 }
 
 #[expect(non_snake_case)]
@@ -70,7 +79,10 @@ pub(crate) fn UserAgent(user_agent: &str) -> DOMString {
 
 #[expect(non_snake_case)]
 pub(crate) fn AppVersion() -> DOMString {
-    DOMString::from("4.0")
+    match servo_config::persona::get() {
+        Some(persona) => DOMString::from(persona.app_version),
+        None => DOMString::from("4.0"),
+    }
 }
 
 #[expect(non_snake_case)]

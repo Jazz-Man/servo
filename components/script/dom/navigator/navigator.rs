@@ -35,6 +35,7 @@ use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::Permission
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::BodyInit;
 use crate::dom::bindings::error::{Error, Fallible};
+use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
@@ -72,7 +73,10 @@ use crate::network_listener::{FetchResponseListener, ResourceTimingListener, sub
 pub(crate) fn hardware_concurrency() -> u64 {
     static CPUS: LazyLock<u64> = LazyLock::new(|| num_cpus::get().try_into().unwrap_or(1));
 
-    *CPUS
+    match servo_config::persona::get() {
+        Some(persona) => u64::from(persona.hardware_concurrency),
+        None => *CPUS,
+    }
 }
 
 /// <https://html.spec.whatwg.org/multipage/#safelisted-scheme>
@@ -507,6 +511,24 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-hardwareconcurrency>
     fn HardwareConcurrency(&self) -> u64 {
         hardware_concurrency()
+    }
+
+    /// <https://www.w3.org/TR/device-memory/#navigator-interface>
+    /// Persona-driven: the persona's device memory as whole GB (the dataset
+    /// stores Chromium's rounded values), or null when the persona leaves it
+    /// unset. Absent a persona there is no host value to report, so null.
+    fn GetDeviceMemory(&self) -> Option<Finite<f64>> {
+        servo_config::persona::get().and_then(|persona| {
+            persona
+                .device_memory_gb
+                .map(|gb| Finite::wrap(f64::from(gb)))
+        })
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-navigator-webdriver>
+    // Constantly false by product decision (spec D6): this embedder never drives via WebDriver; the attribute exists because its ABSENCE (undefined) is itself a bot signal.
+    fn Webdriver(&self) -> bool {
+        false
     }
 
     /// <https://w3c.github.io/clipboard-apis/#h-navigator-clipboard>

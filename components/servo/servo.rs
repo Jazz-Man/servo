@@ -882,6 +882,12 @@ impl Servo {
         opts::initialize_options(opts.unwrap_or_default());
         let opts = opts::get();
 
+        // Install the process-global navigator persona. Order relative to
+        // preferences is irrelevant, but kept deterministic: persona first.
+        if let Some(persona) = builder.persona {
+            servo_config::persona::set(persona);
+        }
+
         // Set the preferences globally.
         // TODO: It would be better to make these private to a particular Servo instance.
         let preferences = builder.preferences.map(|opts| *opts);
@@ -1409,6 +1415,7 @@ impl EventLoopWaker for DefaultEventLoopWaker {
 pub struct ServoBuilder {
     opts: Option<Box<Opts>>,
     preferences: Option<Box<Preferences>>,
+    persona: Option<servo_config::persona::Persona>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
     http_client: Option<(wreq::Client, std::sync::Arc<cookie_jar::Jar>)>,
@@ -1419,6 +1426,7 @@ impl Default for ServoBuilder {
         Self {
             opts: Default::default(),
             preferences: Default::default(),
+            persona: None,
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
             http_client: None,
@@ -1438,6 +1446,16 @@ impl ServoBuilder {
 
     pub fn preferences(mut self, preferences: Preferences) -> Self {
         self.preferences = Some(Box::new(preferences));
+        self
+    }
+
+    /// Install the process-global navigator persona. Identity getters
+    /// (`navigator.platform`, `navigator.appVersion`, ...) report these
+    /// values once installed; absent a persona they fall back to
+    /// compile-time constants.
+    #[must_use]
+    pub fn persona(mut self, persona: servo_config::persona::Persona) -> Self {
+        self.persona = Some(persona);
         self
     }
 

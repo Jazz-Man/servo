@@ -67,11 +67,20 @@ impl ScreenMethods<crate::DomTypeHolder> for Screen {
 
     /// <https://drafts.csswg.org/cssom-view/#dom-screen-colordepth>
     fn ColorDepth(&self) -> u32 {
-        24
+        color_depth()
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-screen-pixeldepth>
     fn PixelDepth(&self) -> u32 {
-        24
+        color_depth()
+    }
+}
+
+/// Persona-first color depth, with 24 (the historic constant servo reports
+/// for every screen) as the fallback.
+fn color_depth() -> u32 {
+    match servo_config::persona::get() {
+        Some(persona) => u32::from(persona.color_depth),
+        None => 24,
     }
 }
